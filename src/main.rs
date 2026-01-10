@@ -9,7 +9,6 @@ use anyhow::Result;
 use clap::Parser;
 use log::{info, error};
 use std::env;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author = "HUA Haohui", version, about = "P2P 直连组网工具", long_about = None)]
@@ -38,6 +37,7 @@ async fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    info!("dend-p2p v{} - P2P 直连组网工具", env!("CARGO_PKG_VERSION"));
     info!("正在加载配置: {}", args.config);
 
     let config = match config::Config::load(&args.config) {

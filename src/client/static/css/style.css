@@ -519,3 +519,80 @@ body {
     font-size: 12px;
     margin-top: 4px;
 }
+
+/* 在线设备列表 */
+.device-list {
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.device-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px;
+    background: rgba(51, 65, 85, 0.3);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.device-item:hover {
+    background: rgba(51, 65, 85, 0.6);
+}
+
+.device-item.empty {
+    justify-content: center;
+    color: var(--text-secondary);
+    cursor: default;
+}
+
+.device-item.empty:hover {
+    background: rgba(51, 65, 85, 0.3);
+}
+
+.device-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.device-id {
+    font-weight: 500;
+    font-size: 14px;
+}
+
+.device-ip {
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', Monaco, monospace;
+}
+
+.device-status {
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.device-status.online {
+    background: rgba(34, 197, 94, 0.2);
+    color: var(--success);
+}
+
+.device-status.offline {
+    background: rgba(239, 68, 68, 0.2);
+    color: var(--danger);
+}
+
+/* 状态栏样式调整 */
+.status-bar {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+
+.status-bar .status-item {
+    flex-shrink: 0;
+}

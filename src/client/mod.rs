@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::protocol::{Packet, get_dest_ip};
 use crate::cache::ClientCache;
+use crate::client_webui;
 use anyhow::{Result, Context};
 use log::{info, error, warn, debug};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -10,6 +11,39 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::net::UdpSocket;
 use std::collections::HashMap;
+
+// ==================== NAT 类型定义 ====================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatType {
+    Nat1,     // 完全锥形 (Full Cone) - 任何外部IP都可以连接
+    Nat2,     // 地址限制锥形 (Address Restricted Cone)
+    Nat3,     // 端口限制锥形 (Port Restricted Cone)
+    Nat4,     // 对称型 (Symmetric) - 每个目标地址映射不同端口
+    Unknown,  // 未知
+}
+
+impl NatType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NatType::Nat1 => "1",
+            NatType::Nat2 => "2",
+            NatType::Nat3 => "3",
+            NatType::Nat4 => "4",
+            NatType::Unknown => "unknown",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            NatType::Nat1 => "NAT1 (完全锥形)",
+            NatType::Nat2 => "NAT2 (地址限制)",
+            NatType::Nat3 => "NAT3 (端口限制)",
+            NatType::Nat4 => "NAT4 (对称型)",
+            NatType::Unknown => "NAT (未知)",
+        }
+    }
+}
 
 // ==================== 连接模式管理 ====================
 
@@ -53,6 +87,7 @@ struct ConnectionState {
     is_connecting: bool,
     connect_failed: bool,
     connect_message: String,
+    punch_initiated: bool, // v0.2.3: 是否已发起打洞（用户点击连接后才为true）
 }
 
 impl Default for ConnectionState {
@@ -70,6 +105,7 @@ impl Default for ConnectionState {
             is_connecting: false,
             connect_failed: false,
             connect_message: String::new(),
+            punch_initiated: false,
         }
     }
 }
@@ -93,6 +129,8 @@ struct PunchHoleConfig {
     enable_relay: bool,
     punch_timeout: u64,
     relay_fallback: bool,
+    keepalive_interval: u64,  // v0.2.3: 保活间隔（秒）
+    punch_interval: u64,      // v0.2.3: 打洞包间隔（毫秒）
 }
 
 impl Default for PunchHoleConfig {
@@ -104,6 +142,8 @@ impl Default for PunchHoleConfig {
             enable_relay: true,
             punch_timeout: 10,
             relay_fallback: true,
+            keepalive_interval: 30,  // 每30秒发送一次保活包（NAT超时通常为30-60秒）
+            punch_interval: 200,     // 每200ms发送一次打洞包
         }
     }
 }
@@ -136,9 +176,13 @@ pub async fn run(config: Config) -> Result<()> {
 
     // ==================== 阶段 1: 握手 ====================
     let my_ip: Ipv4Addr;
-    let network_cidr: String;
 
+    info!("========================================");
+    info!("  dend-p2p v{} - P2P 直连组网工具", env!("CARGO_PKG_VERSION"));
+    info!("========================================");
+    info!("我的连接码: {}", client_id);
     info!("正在与服务器握手...");
+
     loop {
         let packet = Packet::Handshake {
             token: config.token.clone(),
@@ -155,10 +199,13 @@ pub async fn run(config: Config) -> Result<()> {
         match res {
             Ok(Ok((len, src))) => {
                 if src == server_addr {
-                    if let Ok(Packet::HandshakeAck { ip, cidr }) = bincode::deserialize::<Packet>(&buf[..len]) {
-                        info!("握手成功! 分配 IP: {}", ip);
+                    if let Ok(Packet::HandshakeAck { ip, cidr: _ }) = bincode::deserialize::<Packet>(&buf[..len]) {
+                        info!("========================================");
+                        info!("  连接成功!");
+                        info!("========================================");
+                        info!("我的连接码: {}", client_id);
+                        info!("我的虚拟IP: {}/24", ip);
                         my_ip = ip.parse()?;
-                        network_cidr = cidr;
                         break;
                     }
                 }
@@ -169,13 +216,27 @@ pub async fn run(config: Config) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    // ==================== 阶段 1.5: NAT 类型检测 ====================
+    let nat_type = detect_nat_type(socket.clone(), server_addr, local_addr).await;
+    info!("NAT 类型: {}", nat_type.display_name());
+
     // ==================== 阶段 2: 创建 TUN 设备 ====================
     let tun_dev = create_tun_device(&config.tun_name, my_ip).await?;
     info!("TUN 设备已创建: {}", my_ip);
 
     let (mut tun_reader, mut tun_writer) = tokio::io::split(tun_dev);
 
-    // ==================== 阶段 3: 注册服务器请求处理器 ====================
+    // ==================== 阶段 3: 启动 WEBUI 服务器 ====================
+    let _conn_state_webui = conn_state.clone();
+    let client_id_webui = client_id.clone();
+    let my_ip_webui = my_ip;
+
+    tokio::spawn(async move {
+        client_webui::set_local_info(&client_id_webui, &my_ip_webui.to_string(), nat_type.as_str());
+        client_webui::start_web_server().await;
+    });
+
+    // ==================== 阶段 4: 注册服务器请求处理器 ====================
 
     let socket_clone = socket.clone();
     let conn_state_clone = conn_state.clone();
@@ -211,45 +272,92 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // ==================== 阶段 4: 心跳和打洞任务 ====================
+    // ==================== 阶段 5: 心跳、保活和打洞任务 ====================
     let socket_ka = socket.clone();
     let conn_state_ka = conn_state.clone();
-    let peer_map_ka = peer_map.clone();
+    let _peer_map_ka = peer_map.clone();
     let punch_config_ka = punch_config.clone();
+    let server_addr_ka = server_addr;
 
     tokio::spawn(async move {
         let mut last_beat_time = Instant::now();
+        let mut last_keepalive_time = Instant::now();
+
         loop {
             let now = Instant::now();
             let elapsed = now.duration_since(last_beat_time);
+            let keepalive_elapsed = now.duration_since(last_keepalive_time);
+
+            // v0.2.3: 检查是否有 P2P 连接触发请求
+            if let Some(target_id) = client_webui::get_p2p_trigger() {
+                info!("收到 P2P 连接请求: {}", target_id);
+
+                // 发送连接请求到服务器
+                let packet = Packet::RequestConnect {
+                    target_id: target_id.clone(),
+                    password: String::new(),
+                };
+
+                if let Ok(bytes) = bincode::serialize(&packet) {
+                    let _ = socket_ka.send_to(&bytes, server_addr_ka).await;
+                    info!("已发送 P2P 连接请求到服务器");
+
+                    // 更新状态
+                    let mut state = conn_state_ka.write().await;
+                    state.is_connecting = true;
+                    state.connect_message = "正在等待服务器响应...".to_string();
+                    state.punch_initiated = true;  // 标记已开始打洞
+                }
+            }
 
             // 发送心跳到服务器 (每 3 秒)
             if elapsed.as_secs() >= 3 {
                 let ping = Packet::Ping(now.duration_since(Instant::now()).as_millis() as u64);
                 if let Ok(bytes) = bincode::serialize(&ping) {
-                    let _ = socket_ka.send_to(&bytes, server_addr).await;
+                    let _ = socket_ka.send_to(&bytes, server_addr_ka).await;
                 }
                 last_beat_time = now;
             }
 
             // 获取当前连接状态
-            let state = conn_state_ka.read().await;
-
-            // 如果有对等节点，处理打洞和心跳
-            if let (Some(peer_addr), Some(peer_vip)) = (state.peer_addr, state.peer_vip) {
-                drop(state);
-
+            let (is_p2p, punch_initiated, peer_addr, peer_vip, last_punch) = {
                 let state = conn_state_ka.read().await;
-                let mut need_write = false;
+                (
+                    state.is_p2p,
+                    state.punch_initiated,
+                    state.peer_addr,
+                    state.peer_vip,
+                    state.last_punch,
+                )
+            };
 
-                if !state.is_p2p {
-                    // P2P 模式：打洞
-                    if now.duration_since(state.last_punch).as_millis() >= 500 {
-                        drop(state);
+            // v0.2.3: 增强保活机制
+            // 如果 P2P 已建立，定期发送保活包防止 NAT 映射超时
+            if is_p2p && keepalive_elapsed.as_secs() >= punch_config_ka.keepalive_interval {
+                // 发送保活包到对等节点
+                if let Some(addr) = peer_addr {
+                    let ping = Packet::Ping(now.duration_since(Instant::now()).as_millis() as u64);
+                    if let Ok(bytes) = bincode::serialize(&ping) {
+                        let _ = socket_ka.send_to(&bytes, addr).await;
+                        debug!("发送 P2P 保活包到 {}", addr);
+                    }
+                }
 
-                        let punch_config = &*punch_config_ka;
-                        let peer_addr_copy = peer_addr;
-                        let peer_port = peer_addr_copy.port();
+                let mut state = conn_state_ka.write().await;
+                state.last_punch = now;
+                last_keepalive_time = now;
+            }
+
+            // 如果有对等节点，处理打洞
+            if let (Some(addr), Some(_vip)) = (peer_addr, peer_vip) {
+                // v0.2.3: 只有用户点击连接后才开始打洞
+                if punch_initiated && !is_p2p {
+                    let punch_config = &*punch_config_ka;
+                    let punch_interval = punch_config.punch_interval;
+
+                    // 检查是否到了发送打洞包的时间
+                    if now.duration_since(last_punch).as_millis() >= punch_interval as u128 {
+                        let peer_port = addr.port();
                         let ports: Vec<u16> = generate_port_list(
                             peer_port,
                             punch_config.port_range,
@@ -262,11 +370,11 @@ pub async fn run(config: Config) -> Result<()> {
                         // 并发发送打洞包
                         for (i, port) in ports.into_iter().enumerate() {
                             // 不要向自己打洞
-                            if local_addr.port() == port && local_addr.ip() == peer_addr_copy.ip() {
+                            if local_addr.port() == port && local_addr.ip() == addr.ip() {
                                 continue;
                             }
 
-                            let target_addr = SocketAddr::new(peer_addr_copy.ip(), port);
+                            let target_addr = SocketAddr::new(addr.ip(), port);
                             let socket = socket_ka.clone();
                             let packet = Packet::Punch {
                                 vip: my_ip.to_string(),
@@ -292,23 +400,10 @@ pub async fn run(config: Config) -> Result<()> {
                             let _ = handle.await;
                         }
 
-                        need_write = true;
+                        let mut state = conn_state_ka.write().await;
+                        state.last_punch = now;
+                        state.punch_attempts += 1;
                     }
-                } else {
-                    // 直连模式：发送心跳维持连接
-                    if now.duration_since(state.last_punch).as_secs() >= 2 {
-                        let ping = Packet::Ping(now.duration_since(Instant::now()).as_millis() as u64);
-                        if let Ok(bytes) = bincode::serialize(&ping) {
-                            let _ = socket_ka.send_to(&bytes, peer_addr).await;
-                        }
-                        need_write = true;
-                    }
-                }
-
-                if need_write {
-                    let mut state = conn_state_ka.write().await;
-                    state.last_punch = now;
-                    state.punch_attempts += 1;
                 }
             }
 
@@ -316,10 +411,10 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // ==================== 阶段 5: TUN -> Socket 数据转发 ====================
+    // ==================== 阶段 6: TUN -> Socket 数据转发 ====================
     let socket_send = socket.clone();
     let conn_state_send = conn_state.clone();
-    let peer_map_send = peer_map.clone();
+    let _peer_map_send = peer_map.clone();
 
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -329,7 +424,7 @@ pub async fn run(config: Config) -> Result<()> {
                     if len == 0 { break; }
                     let data = &buf[..len];
 
-                    if let Some(dst_ip) = get_dest_ip(data) {
+                    if let Some(_dst_ip) = get_dest_ip(data) {
                         let target_addr = {
                             let state = conn_state_send.read().await;
                             if state.is_p2p && state.peer_addr.is_some() {
@@ -355,10 +450,11 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // ==================== 阶段 6: Socket -> TUN 数据接收 ====================
+    // ==================== 阶段 7: Socket -> TUN 数据接收 ====================
     let socket_recv = socket.clone();
     let conn_state_recv = conn_state.clone();
-    let peer_map_recv = peer_map.clone();
+    let _peer_map_recv = peer_map.clone();
+    let _punch_config_recv = punch_config.clone();
 
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -388,8 +484,25 @@ pub async fn run(config: Config) -> Result<()> {
                                     state.last_mode_change = Instant::now();
                                     state.is_connecting = false;
                                     state.connect_message = String::new();
+                                    state.punch_initiated = false;  // 重置打洞标记
 
                                     info!("切换到直连模式");
+
+                                    // 更新 WEBUI 状态
+                                    client_webui::set_connection_status(
+                                        client_webui::ConnectionStatus {
+                                            mode: "直连".to_string(),
+                                            mode_code: 0,
+                                            is_connected: true,
+                                            status_text: "P2P 连接已建立".to_string(),
+                                            is_connecting: false,
+                                            connect_failed: false,
+                                            connect_message: String::new(),
+                                            peer_ip: src.ip().to_string(),
+                                            peer_latency: state.last_latency,
+                                            online_devices: vec![],
+                                        }
+                                    );
                                 }
                             }
                             Packet::Ping(ts) => {
@@ -400,16 +513,50 @@ pub async fn run(config: Config) -> Result<()> {
                                 }
                             }
                             Packet::Pong(ts) => {
+                                // ts 是发送 Ping 包时的时间戳（毫秒）
+                                let send_time = std::time::SystemTime::UNIX_EPOCH
+                                    + std::time::Duration::from_millis(ts);
+                                let send_instant = std::time::Instant::now()
+                                    - std::time::SystemTime::now()
+                                        .duration_since(send_time)
+                                        .unwrap_or(std::time::Duration::ZERO);
                                 let now = Instant::now();
-                                let rtt = now.duration_since(Instant::now()).as_millis() as u64;
+                                let rtt = now.duration_since(send_instant).as_millis() as i32;
 
                                 let mut state = conn_state_recv.write().await;
-                                state.last_latency = rtt as i32;
+                                state.last_latency = rtt;
 
-                                if src == server_addr {
+                                // 过滤自身连接（跳过直连模式下的自身回环）
+                                let is_self = if let Some(peer_addr) = state.peer_addr {
+                                    src.port() == peer_addr.port() && src.ip() == peer_addr.ip()
+                                } else {
+                                    false
+                                };
+
+                                if is_self {
+                                    debug!("收到自身的Pong包，忽略");
+                                } else if src == server_addr {
                                     info!("【中转】延迟: {} ms", rtt);
                                 } else {
                                     info!("【P2P】延迟: {} ms (来自 {})", rtt, src);
+
+                                    // 更新 WEBUI 延迟显示
+                                    if state.is_p2p {
+                                        client_webui::set_connection_status(
+                                            client_webui::ConnectionStatus {
+                                                mode: "直连".to_string(),
+                                                mode_code: 0,
+                                                is_connected: true,
+                                                status_text: "P2P 连接已建立".to_string(),
+                                                is_connecting: false,
+                                                connect_failed: false,
+                                                connect_message: String::new(),
+                                                peer_ip: src.ip().to_string(),
+                                                peer_latency: state.last_latency,
+                                                online_devices: vec![],
+                                            }
+                                        );
+                                    }
                                 }
                             }
                             _ => {}
@@ -429,14 +576,68 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+// ==================== NAT 类型检测 ====================
+
+async fn detect_nat_type(socket: Arc<UdpSocket>, server_addr: SocketAddr, local_addr: SocketAddr) -> NatType {
+    // v0.2.3 NAT 类型检测流程：
+    // 1. 向服务器发送检测包，服务器返回它看到的源IP和端口
+    // 2. 比较本地端口和服务器看到的端口
+    // 3. 如果相同，可能是 NAT1 (完全锥形) 或无 NAT
+    // 4. 如果不同，进一步检测 NAT 类型
+
+    info!("开始 NAT 类型检测...");
+
+    // 向服务器发送 NAT 类型检测请求
+    let packet = Packet::NatTypeDetect {
+        port: local_addr.port(),
+    };
+
+    if let Ok(bytes) = bincode::serialize(&packet) {
+        if let Ok(_) = socket.send_to(&bytes, server_addr).await {
+            // 等待服务器响应
+            let mut buf = [0u8; 1024];
+            let timeout_result = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await;
+
+            match timeout_result {
+                Ok(Ok((len, src))) => {
+                    if src == server_addr {
+                        if let Ok(Packet::NatTypeResult { nat_type, mapped_port, .. }) =
+                            bincode::deserialize::<Packet>(&buf[..len])
+                        {
+                            info!("NAT 检测结果: 类型={}, 映射端口={}", nat_type, mapped_port);
+
+                            return match nat_type {
+                                1 => NatType::Nat1,
+                                2 => NatType::Nat2,
+                                3 => NatType::Nat3,
+                                4 => NatType::Nat4,
+                                _ => NatType::Unknown,
+                            };
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("NAT 检测接收错误: {}", e);
+                }
+                Err(_) => {
+                    warn!("NAT 检测超时");
+                }
+            }
+        }
+    }
+
+    // 检测失败，返回 Unknown
+    NatType::Unknown
+}
+
 // ==================== 处理服务器命令 ====================
 
 async fn handle_server_packet(
     packet: &Packet,
-    socket: &UdpSocket,
-    src: SocketAddr,
+    _socket: &UdpSocket,
+    _src: SocketAddr,
     conn_state: &Arc<RwLock<ConnectionState>>,
-    peer_map: &Arc<Mutex<HashMap<Ipv4Addr, PeerState>>>,
+    _peer_map: &Arc<Mutex<HashMap<Ipv4Addr, PeerState>>>,
     punch_config: &Arc<PunchHoleConfig>,
 ) {
     match packet {
@@ -469,6 +670,22 @@ async fn handle_server_packet(
                             state.mode = ConnectionMode::Relay;
                             state.connect_message = "使用中转模式".to_string();
                             info!("已切换到中转模式");
+
+                            // 更新 WEBUI 状态
+                            client_webui::set_connection_status(
+                                client_webui::ConnectionStatus {
+                                    mode: "中转".to_string(),
+                                    mode_code: 1,
+                                    is_connected: false,
+                                    status_text: "中转模式".to_string(),
+                                    is_connecting: false,
+                                    connect_failed: true,
+                                    connect_message: String::new(),
+                                    peer_ip: String::new(),
+                                    peer_latency: -1,
+                                    online_devices: vec![],
+                                }
+                            );
                         } else {
                             state.connect_failed = true;
                             state.connect_message = "连接失败：无法建立 P2P 连接".to_string();
@@ -480,7 +697,6 @@ async fn handle_server_packet(
         }
         Packet::ConnectPeer { peer_vip, peer_addr, port, .. } => {
             // 服务器通知连接对等节点
-            // peer_vip 和 peer_addr 已经是 Ipv4Addr 类型
             let vip = *peer_vip;
             let raddr = SocketAddr::new(std::net::IpAddr::V4(*peer_addr), *port);
 
@@ -491,8 +707,11 @@ async fn handle_server_packet(
             state.peer_vip = Some(vip);
             state.is_connecting = true;
             state.connect_message = "正在打洞...".to_string();
+
+            // v0.2.3: 只有 punch_initiated 为 true 时才真正开始打洞
+            // 这样可以确保用户点击连接按钮后才开始 P2P 尝试
         }
-        Packet::ChangePort { password } => {
+        Packet::ChangePort { password: _ } => {
             info!("收到服务器更换端口命令");
             // 实际更换端口逻辑在客户端比较复杂，这里简化处理
         }
@@ -505,6 +724,22 @@ async fn handle_server_packet(
                 state.is_connecting = false;
                 state.connect_message = String::new();
                 info!("中转模式已启用，对等节点: {}", peer_id);
+
+                // 更新 WEBUI 状态
+                client_webui::set_connection_status(
+                    client_webui::ConnectionStatus {
+                        mode: "中转".to_string(),
+                        mode_code: 1,
+                        is_connected: true,
+                        status_text: "中转模式已启用".to_string(),
+                        is_connecting: false,
+                        connect_failed: false,
+                        connect_message: String::new(),
+                        peer_ip: peer_vip.clone(),
+                        peer_latency: -1,
+                        online_devices: vec![],
+                    }
+                );
             }
         }
         Packet::DisconnectPeer => {
@@ -516,6 +751,23 @@ async fn handle_server_packet(
             state.is_p2p = false;
             state.is_connecting = false;
             state.connect_message = String::new();
+            state.punch_initiated = false;
+
+            // 更新 WEBUI 状态
+            client_webui::set_connection_status(
+                client_webui::ConnectionStatus {
+                    mode: "断开".to_string(),
+                    mode_code: 2,
+                    is_connected: false,
+                    status_text: "已断开".to_string(),
+                    is_connecting: false,
+                    connect_failed: false,
+                    connect_message: String::new(),
+                    peer_ip: String::new(),
+                    peer_latency: -1,
+                    online_devices: vec![],
+                }
+            );
         }
         _ => {}
     }
@@ -580,6 +832,7 @@ pub async fn get_connection_status() -> String {
         "isConnected": false,
         "isConnecting": false,
         "connectFailed": false,
-        "connectMessage": ""
+        "connectMessage": "",
+        "natType": "unknown"
     }).to_string()
 }

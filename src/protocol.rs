@@ -57,6 +57,10 @@ pub enum Packet {
     Ping(u64), // timestamp (millis)
     Pong(u64), // echo timestamp
 
+    // v0.2.3 NAT 类型检测
+    NatTypeDetect { port: u16 },
+    NatTypeResult { nat_type: u8, mapped_port: u16, external_ip: String },
+
     Error(String),
 }
 

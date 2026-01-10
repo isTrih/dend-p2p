@@ -137,7 +137,7 @@ pub async fn run(config: Config) -> Result<()> {
     let relay_sessions_recv = relay_sessions.clone();
     let config_token = config.token.clone();
     let cidr_str_clone = cidr_str.clone();
-    let server_ip_clone = server_ip;
+    let _server_ip_clone = server_ip;
 
     // IP 分配器
     let find_free_ip = move |peers: &HashMap<SocketAddr, ClientInfo>| -> Option<Ipv4Addr> {
@@ -307,7 +307,7 @@ pub async fn run(config: Config) -> Result<()> {
                             Packet::PortChanged { client_id: cid } => {
                                 debug!("收到客户端 {} 端口更换完成通知", cid);
 
-                                let mut sessions = nat_sessions_recv.lock().await;
+                                let sessions = nat_sessions_recv.lock().await;
                                 if let Some(session) = sessions.get(&cid) {
                                     // 通知双方开始打洞
                                     send_connect_peer(
@@ -376,6 +376,41 @@ pub async fn run(config: Config) -> Result<()> {
                                         let _ = socket_recv.send_to(&bytes, target.addr).await;
                                     }
                                 }
+                            }
+
+                            // ==================== v0.2.3 NAT 类型检测 ====================
+                            Packet::NatTypeDetect { port: client_port } => {
+                                // 服务器看到的客户端信息
+                                let external_ip = match addr.ip() {
+                                    std::net::IpAddr::V4(ip) => ip.to_string(),
+                                    std::net::IpAddr::V6(_) => "".to_string(),
+                                };
+
+                                // 简单 NAT 类型判断：
+                                // 1. 如果客户端本地端口 == 服务器看到端口，且是公网IP -> 无 NAT (NAT1)
+                                // 2. 如果端口相同但IP不同 -> NAT1 (完全锥形)
+                                // 3. 如果端口不同 -> 需要进一步检测
+
+                                // 简化处理：默认返回 Unknown，实际类型需要更复杂的检测
+                                let nat_type = if client_port == addr.port() {
+                                    // 端口一致，可能是锥形 NAT 或无 NAT
+                                    1 // NAT1
+                                } else {
+                                    // 端口不一致，可能是对称 NAT 或端口限制
+                                    4 // NAT4 (保守估计)
+                                };
+
+                                let packet = Packet::NatTypeResult {
+                                    nat_type,
+                                    mapped_port: addr.port(),
+                                    external_ip,
+                                };
+
+                                if let Ok(bytes) = bincode::serialize(&packet) {
+                                    let _ = socket_recv.send_to(&bytes, addr).await;
+                                }
+
+                                info!("NAT 检测响应: 类型={}, 端口={}", nat_type, addr.port());
                             }
 
                             // ==================== 数据包中转 ====================
@@ -452,7 +487,7 @@ async fn broadcast_new_peer(
     peers: &HashMap<SocketAddr, ClientInfo>,
     new_addr: SocketAddr,
     new_ip: &Ipv4Addr,
-    new_id: &str,
+    _new_id: &str,
 ) {
     let packet = Packet::PeerInfo {
         peer_vip: new_ip.to_string(),
