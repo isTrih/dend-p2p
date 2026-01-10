@@ -88,6 +88,8 @@ struct ConnectionState {
     connect_failed: bool,
     connect_message: String,
     punch_initiated: bool, // v0.2.3: 是否已发起打洞（用户点击连接后才为true）
+    server_ping_time: Option<Instant>, // 记录发送给服务器的 Ping 时间
+    p2p_ping_time: Option<Instant>,    // 记录发送给 P2P 对等节点的 Ping 时间
 }
 
 impl Default for ConnectionState {
@@ -106,6 +108,8 @@ impl Default for ConnectionState {
             connect_failed: false,
             connect_message: String::new(),
             punch_initiated: false,
+            server_ping_time: None,
+            p2p_ping_time: None,
         }
     }
 }
@@ -226,15 +230,22 @@ pub async fn run(config: Config) -> Result<()> {
 
     let (mut tun_reader, mut tun_writer) = tokio::io::split(tun_dev);
 
-    // ==================== 阶段 3: 启动 WEBUI 服务器 ====================
+    // ==================== 阶段 3: 启动 WEBUI 服务器（如果启用） ====================
     let _conn_state_webui = conn_state.clone();
     let client_id_webui = client_id.clone();
     let my_ip_webui = my_ip;
+    let webui_enabled = config.webui;
 
-    tokio::spawn(async move {
+    if webui_enabled {
+        tokio::spawn(async move {
+            client_webui::set_local_info(&client_id_webui, &my_ip_webui.to_string(), nat_type.as_str());
+            client_webui::start_web_server().await;
+        });
+    } else {
+        // 即使不启动WebUI，也设置本地信息（供API使用）
         client_webui::set_local_info(&client_id_webui, &my_ip_webui.to_string(), nat_type.as_str());
-        client_webui::start_web_server().await;
-    });
+        info!("WebUI 已禁用（Linux 默认），如需启用请在配置文件中设置 webui = true");
+    }
 
     // ==================== 阶段 4: 注册服务器请求处理器 ====================
 
@@ -312,9 +323,17 @@ pub async fn run(config: Config) -> Result<()> {
 
             // 发送心跳到服务器 (每 3 秒)
             if elapsed.as_secs() >= 3 {
-                let ping = Packet::Ping(now.duration_since(Instant::now()).as_millis() as u64);
+                // 使用系统时间作为时间戳
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_millis() as u64;
+                let ping = Packet::Ping(timestamp);
                 if let Ok(bytes) = bincode::serialize(&ping) {
                     let _ = socket_ka.send_to(&bytes, server_addr_ka).await;
+                    // 记录发送时间用于计算延迟
+                    let mut state = conn_state_ka.write().await;
+                    state.server_ping_time = Some(Instant::now());
                 }
                 last_beat_time = now;
             }
@@ -336,15 +355,22 @@ pub async fn run(config: Config) -> Result<()> {
             if is_p2p && keepalive_elapsed.as_secs() >= punch_config_ka.keepalive_interval {
                 // 发送保活包到对等节点
                 if let Some(addr) = peer_addr {
-                    let ping = Packet::Ping(now.duration_since(Instant::now()).as_millis() as u64);
+                    // 使用系统时间作为时间戳
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_millis() as u64;
+                    let ping = Packet::Ping(timestamp);
                     if let Ok(bytes) = bincode::serialize(&ping) {
                         let _ = socket_ka.send_to(&bytes, addr).await;
                         debug!("发送 P2P 保活包到 {}", addr);
+
+                        // 记录发送时间
+                        let mut state = conn_state_ka.write().await;
+                        state.p2p_ping_time = Some(Instant::now());
                     }
                 }
 
-                let mut state = conn_state_ka.write().await;
-                state.last_punch = now;
                 last_keepalive_time = now;
             }
 
@@ -486,7 +512,12 @@ pub async fn run(config: Config) -> Result<()> {
                                     state.connect_message = String::new();
                                     state.punch_initiated = false;  // 重置打洞标记
 
-                                    info!("切换到直连模式");
+                                    info!("========================================");
+                                    info!("  P2P 直连已建立!");
+                                    info!("========================================");
+                                    info!("对等节点: {}", vip_addr);
+                                    info!("连接模式: 直连");
+                                    info!("延迟: {} ms", state.last_latency);
 
                                     // 更新 WEBUI 状态
                                     client_webui::set_connection_status(
@@ -505,28 +536,38 @@ pub async fn run(config: Config) -> Result<()> {
                                     );
                                 }
                             }
-                            Packet::Ping(ts) => {
-                                // 回复 Pong
-                                let pong = Packet::Pong(ts);
+                            Packet::Ping(_ts) => {
+                                // 回复 Pong (直接回传时间戳，不用于延迟计算)
+                                let pong = Packet::Pong(0);
                                 if let Ok(bytes) = bincode::serialize(&pong) {
                                     let _ = socket_recv.send_to(&bytes, src).await;
                                 }
                             }
-                            Packet::Pong(ts) => {
-                                // ts 是发送 Ping 包时的时间戳（毫秒）
-                                let send_time = std::time::SystemTime::UNIX_EPOCH
-                                    + std::time::Duration::from_millis(ts);
-                                let send_instant = std::time::Instant::now()
-                                    - std::time::SystemTime::now()
-                                        .duration_since(send_time)
-                                        .unwrap_or(std::time::Duration::ZERO);
-                                let now = Instant::now();
-                                let rtt = now.duration_since(send_instant).as_millis() as i32;
-
+                            Packet::Pong(_ts) => {
+                                // 使用记录的发送时间来计算延迟
                                 let mut state = conn_state_recv.write().await;
+                                let now = Instant::now();
+                                let rtt = if src == server_addr {
+                                    // 服务器延迟
+                                    if let Some(ping_time) = state.server_ping_time {
+                                        state.server_ping_time = None; // 清除已使用的记录
+                                        now.duration_since(ping_time).as_millis() as i32
+                                    } else {
+                                        -1 // 无法计算
+                                    }
+                                } else {
+                                    // P2P 延迟
+                                    if let Some(ping_time) = state.p2p_ping_time {
+                                        state.p2p_ping_time = None; // 清除已使用的记录
+                                        now.duration_since(ping_time).as_millis() as i32
+                                    } else {
+                                        -1 // 无法计算
+                                    }
+                                };
+
                                 state.last_latency = rtt;
 
-                                // 过滤自身连接（跳过直连模式下的自身回环）
+                                // 过滤自身连接
                                 let is_self = if let Some(peer_addr) = state.peer_addr {
                                     src.port() == peer_addr.port() && src.ip() == peer_addr.ip()
                                 } else {
@@ -535,6 +576,8 @@ pub async fn run(config: Config) -> Result<()> {
 
                                 if is_self {
                                     debug!("收到自身的Pong包，忽略");
+                                } else if rtt < 0 {
+                                    debug!("收到Pong但无对应Ping记录，忽略");
                                 } else if src == server_addr {
                                     info!("【中转】延迟: {} ms", rtt);
                                 } else {
@@ -669,20 +712,25 @@ async fn handle_server_packet(
                         if punch_config.enable_relay && punch_config.relay_fallback {
                             state.mode = ConnectionMode::Relay;
                             state.connect_message = "使用中转模式".to_string();
-                            info!("已切换到中转模式");
+
+                            info!("========================================");
+                            info!("  P2P 直连失败，切换到中转模式");
+                            info!("========================================");
+                            info!("对等节点: {}", state.peer_vip.map(|v| v.to_string()).unwrap_or_else(|| "未知".to_string()));
+                            info!("连接模式: 中转");
 
                             // 更新 WEBUI 状态
                             client_webui::set_connection_status(
                                 client_webui::ConnectionStatus {
                                     mode: "中转".to_string(),
                                     mode_code: 1,
-                                    is_connected: false,
+                                    is_connected: true,
                                     status_text: "中转模式".to_string(),
                                     is_connecting: false,
-                                    connect_failed: true,
+                                    connect_failed: false,
                                     connect_message: String::new(),
-                                    peer_ip: String::new(),
-                                    peer_latency: -1,
+                                    peer_ip: state.peer_addr.map(|a| a.ip().to_string()).unwrap_or_default(),
+                                    peer_latency: state.last_latency,
                                     online_devices: vec![],
                                 }
                             );
@@ -690,6 +738,11 @@ async fn handle_server_packet(
                             state.connect_failed = true;
                             state.connect_message = "连接失败：无法建立 P2P 连接".to_string();
                             state.is_connecting = false;
+
+                            error!("========================================");
+                            error!("  P2P 连接失败");
+                            error!("========================================");
+                            error!("对等节点: {}", state.peer_vip.map(|v| v.to_string()).unwrap_or_else(|| "未知".to_string()));
                         }
                     }
                 });
@@ -700,13 +753,18 @@ async fn handle_server_packet(
             let vip = *peer_vip;
             let raddr = SocketAddr::new(std::net::IpAddr::V4(*peer_addr), *port);
 
-            info!("服务器通知连接对等节点: VIP={} Addr={}", vip, raddr);
+            info!("========================================");
+            info!("  收到服务器连接指令");
+            info!("========================================");
+            info!("目标连接码: {}", vip);
+            info!("目标地址: {}", raddr);
+            info!("请在WEBUI中点击连接按钮发起P2P连接");
 
             let mut state = conn_state.write().await;
             state.peer_addr = Some(raddr);
             state.peer_vip = Some(vip);
-            state.is_connecting = true;
-            state.connect_message = "正在打洞...".to_string();
+            state.is_connecting = false;
+            state.connect_message = "等待用户点击连接...".to_string();
 
             // v0.2.3: 只有 punch_initiated 为 true 时才真正开始打洞
             // 这样可以确保用户点击连接按钮后才开始 P2P 尝试
@@ -768,6 +826,20 @@ async fn handle_server_packet(
                     online_devices: vec![],
                 }
             );
+        }
+        Packet::DeviceList { devices } => {
+            debug!("收到设备列表，共 {} 个设备", devices.len());
+            // 更新 WEBUI 中的在线设备列表
+            let online_devices: Vec<client_webui::OnlineDevice> = devices.iter()
+                .filter(|d| d.is_online)
+                .map(|d| client_webui::OnlineDevice {
+                    client_id: d.client_id.clone(),
+                    vip: d.vip.clone(),
+                    is_online: d.is_online,
+                })
+                .collect();
+
+            client_webui::update_online_devices(online_devices);
         }
         _ => {}
     }

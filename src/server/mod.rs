@@ -91,6 +91,7 @@ pub async fn run(config: Config) -> Result<()> {
     let peer_map_clean = peer_map.clone();
     let client_id_map_clean = client_id_map.clone();
     let nat_sessions_clean = nat_sessions.clone();
+    let socket_broadcast = socket.clone();
 
     tokio::spawn(async move {
         loop {
@@ -124,6 +125,42 @@ pub async fn run(config: Config) -> Result<()> {
                 sessions.retain(|_key, session| {
                     now.duration_since(session.created_at).as_secs() < 300
                 });
+            }
+        }
+    });
+
+    // ==================== 阶段 1.5: 设备列表广播任务 ====================
+    let peer_map_devices = peer_map.clone();
+    let client_id_map_devices = client_id_map.clone();
+    let socket_devices = socket.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await; // 每10秒广播一次设备列表
+            let now = Instant::now();
+
+            let peers = peer_map_devices.lock().await;
+            let _id_map = client_id_map_devices.lock().await;
+
+            // 构建设备列表
+            let devices: Vec<_> = peers.iter().map(|(_addr, client)| {
+                crate::protocol::DeviceInfo {
+                    client_id: client.client_id.clone(),
+                    vip: client.vip.unwrap_or(Ipv4Addr::new(0,0,0,0)).to_string(),
+                    is_online: now.duration_since(client.last_seen).as_secs() < 60,
+                }
+            }).collect();
+
+            if devices.is_empty() {
+                continue;
+            }
+
+            let packet = Packet::DeviceList { devices: devices.clone() };
+            if let Ok(bytes) = bincode::serialize(&packet) {
+                for (addr, _) in peers.iter() {
+                    let _ = socket_devices.send_to(&bytes, *addr).await;
+                }
+                debug!("已广播设备列表，共 {} 个设备", devices.len());
             }
         }
     });

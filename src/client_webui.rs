@@ -74,6 +74,12 @@ pub fn set_connection_status(status: ConnectionStatus) {
     *s = status;
 }
 
+/// 更新在线设备列表（供客户端模块调用）
+pub fn update_online_devices(devices: Vec<OnlineDevice>) {
+    let mut s = CONNECTION_STATUS.lock().unwrap();
+    s.online_devices = devices;
+}
+
 /// 设置 P2P 连接触发器（供 WEBUI API 调用）
 pub fn set_p2p_trigger(target_id: String) {
     let mut trigger = P2P_TRIGGER.lock().unwrap();

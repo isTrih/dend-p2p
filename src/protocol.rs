@@ -61,7 +61,17 @@ pub enum Packet {
     NatTypeDetect { port: u16 },
     NatTypeResult { nat_type: u8, mapped_port: u16, external_ip: String },
 
+    // v0.2.4 在线设备列表
+    DeviceList { devices: Vec<DeviceInfo> },
+
     Error(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeviceInfo {
+    pub client_id: String,
+    pub vip: String,
+    pub is_online: bool,
 }
 
 // 简单的 IPv4 Header 解析辅助 (只为了拿 dst ip)

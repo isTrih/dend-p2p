@@ -15,9 +15,25 @@ pub struct Config {
     pub server_addr: String,
     pub token: String,
     pub tun_name: Option<String>,
-    
+
     // Server specific
     pub cidr: Option<String>,
+
+    // Client specific
+    #[serde(default = "default_webui")]
+    pub webui: bool,
+}
+
+fn default_webui() -> bool {
+    // Linux 默认关闭 WebUI，macOS/Windows 默认开启
+    #[cfg(target_os = "linux")]
+    {
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 impl Config {
