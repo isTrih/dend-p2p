@@ -1,0 +1,111 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  WINTUN_VERSION: "0.14.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (musl for static linking)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: dend-p2p-linux-x86_64
+            use_cross: true
+            binary_name: dend-p2p
+            asset_loss: config.toml
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: dend-p2p-windows-x86_64
+            use_cross: false
+            binary_name: dend-p2p.exe
+            
+          # macOS ARM64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: dend-p2p-macos-aarch64
+            use_cross: false
+            binary_name: dend-p2p
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Install cross if needed
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross
+
+      # Build
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      # Prepare Staging Directory
+      - name: Prepare Artifacts
+        shell: bash
+        run: |
+          mkdir staging
+          
+          # Copy Binary
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} staging/
+          
+          # Copy Config
+          cp config.toml staging/
+          
+          # Grant Executable Permission (Linux/macOS)
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            chmod +x staging/${{ matrix.binary_name }}
+          fi
+
+      # Windows Specific: Download Wintun
+      - name: Download Wintun (Windows Only)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $Url = "https://www.wintun.net/builds/wintun-${{ env.WINTUN_VERSION }}.zip"
+          $Zip = "wintun.zip"
+          Invoke-WebRequest -Uri $Url -OutFile $Zip
+          Expand-Archive -Path $Zip -DestinationPath wintun_extract
+          Copy-Item "wintun_extract/wintun/bin/amd64/wintun.dll" -Destination "staging/"
+          Remove-Item $Zip
+          Remove-Item -Recurse wintun_extract
+
+      # Archive
+      - name: Create Archive
+        shell: bash
+        run: |
+          cd staging
+          zip -r ../${{ matrix.name }}.zip ./*
+          cd ..
+
+      # Upload Release Asset
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.name }}.zip
