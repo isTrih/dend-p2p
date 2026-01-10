@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Packet {
-    Handshake { token: String },
+    Handshake { token: String, client_id: String },
     HandshakeAck { ip: String, cidr: String },
     Data(Vec<u8>), // Raw IP packet
     Keepalive,

@@ -8,7 +8,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::Duration;
 
+mod cache;
+
 pub async fn run(config: Config) -> Result<()> {
+    // Load or create client ID
+    let cache = crate::cache::ClientCache::load_or_create();
+    let client_id = cache.client_id;
+    info!("Using Client ID: {}", client_id);
+
     // Resolve server address
     let server_addr: SocketAddr = config.server_addr.parse().context("服务器地址无效")?;
     
@@ -22,7 +29,7 @@ pub async fn run(config: Config) -> Result<()> {
     
     loop {
         info!("正在向服务器 {} 发送握手请求...", server_addr);
-        let packet = Packet::Handshake { token: config.token.clone() };
+        let packet = Packet::Handshake { token: config.token.clone(), client_id: client_id.clone() };
         let bytes = bincode::serialize(&packet)?;
         socket.send_to(&bytes, server_addr).await?;
         
@@ -51,11 +58,31 @@ pub async fn run(config: Config) -> Result<()> {
     tun_config
         .address(my_ip)
         .netmask(Ipv4Addr::new(255, 255, 255, 0)) // Assuming /24 for now based on server
-        .destination(Ipv4Addr::new(10, 10, 0, 1)) // Set gateway/peer? simple ptp usually
         .up();
+        
+    #[cfg(not(target_os = "windows"))]
+    tun_config.destination(Ipv4Addr::new(10, 10, 0, 1)); // Set gateway/peer? simple ptp usually
 
     if let Some(name) = &config.tun_name {
-        tun_config.name(name);
+        // macOS utun devices must be named "utunX" where X is a number (e.g. utun0, utun1)
+        // or simply allow the system to pick one by not setting a name if the user provided one isn't valid?
+        // But for cross-platform simplicity, we might just let the system pick if on macOS and the name doesn't start with utun.
+        // Or we warn the user.
+        
+        #[cfg(target_os = "macos")]
+        {
+            if !name.starts_with("utun") {
+               warn!("在 macOS 上，TUN 设备名称必须以 'utun' 开头且后跟数字 (如 utun5)。由于配置名称 '{}' 不符合规范，将自动使用系统分配的名称。", name, name);
+               // 不设置 name，让系统自动分配
+            } else {
+                tun_config.name(name);
+            }
+        }
+        
+        #[cfg(not(target_os = "macos"))]
+        {
+            tun_config.name(name);
+        }
     }
     
     #[cfg(target_os = "linux")]
@@ -65,6 +92,21 @@ pub async fn run(config: Config) -> Result<()> {
 
     let tun_dev = tun::create_as_async(&tun_config).context("创建 TUN 设备失败")?;
     info!("TUN 设备已创建");
+    
+    // Windows 平台特殊修复：
+    // 当 TUN 获取到 IP 且子网掩码只有 IP 本身时，路由表可能将发往公网服务器的流量错误地路由到了 TUN 接口。
+    // 这会导致 "UDP 发包 -> 路由到 TUN -> 读取 TUN -> UDP 发包 -> 路由到 TUN" 的死循环，
+    // 或者直接报错 "Unreachable host" (os error 10065)，因为系统认为去往服务器的路径不通。
+    // 
+    // 解决方案：为防止 UDP socket 绑定的流量走 TUN，我们需要将 UDP socket 绑定到具体的物理网卡 IP (但这在 DHCP 下会变且麻烦)。
+    // 或者，更简单的：确保 TUN 的掩码和路由不要覆盖去往服务器 123.60.176.158 的路径。
+    // 当前我们设置了 TUN IP 和默认路由？看代码：destination(10.10.0.1)
+    
+    // Windows 下，tun crate 可能会默认添加路由。如果出现 10065，说明去往 Server 的路由坏了。
+    // 这是一个常见的 VPN/TUN 路由冲突问题。
+    // 暂时可以通过只绑定 socket 到 0.0.0.0 来尝试解决（我们已经这么做了）。
+    // 
+    // 更有可能是 Windows 防火墙或路由表优先级的锅。
     
     let (mut tun_reader, mut tun_writer) = tokio::io::split(tun_dev);
     let socket = Arc::new(socket);

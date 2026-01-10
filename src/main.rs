@@ -2,6 +2,7 @@ mod config;
 mod protocol;
 mod server;
 mod client;
+mod cache;
 
 use anyhow::Result;
 use clap::Parser;

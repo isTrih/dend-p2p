@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct ClientInfo {
     addr: SocketAddr,
-    _last_seen: std::time::Instant,
+    last_seen: std::time::Instant, // Updated on keepalive/data
+    client_id: String,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -22,7 +23,6 @@ pub async fn run(config: Config) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(&config.server_addr).await?);
     
     // 检查是否无人连接，如果有连接才开始 active
-    // 当前为事件驱动模型：如果没有packet收到，process是sleep的，已经是低功耗模式
     info!("Waiting for incoming connections (Low Power Idle Mode)...");
 
     // IP allocation pool (very simple implementation)
@@ -37,15 +37,17 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let server_ip = next_ip(network_ip, 1);
-    let mut current_ip_idx = 2; // Start allocating from .2
     
-    // Setup TUN device for server (to participate in the network)
+    // Setup TUN device for server
     let mut tun_config = tun::Configuration::default();
     tun_config
         .address(server_ip)
         .netmask(Ipv4Addr::new(255, 255, 255, 0))
         .up();
     
+    #[cfg(not(target_os = "windows"))]
+    tun_config.destination(server_ip); // Point-to-point usually needs destination, but depends on platform
+
     if let Some(name) = &config.tun_name {
         tun_config.name(name);
     }
@@ -63,20 +65,41 @@ pub async fn run(config: Config) -> Result<()> {
     // Map Virtual IP -> Client Real Addr
     let peer_map: Arc<Mutex<HashMap<Ipv4Addr, ClientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     
+    // Auto-release task
+    let peer_map_clean = peer_map.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut peers = peer_map_clean.lock().await;
+            let now = std::time::Instant::now();
+            // Remove clients silent for > 60s
+            let before_count = peers.len();
+            peers.retain(|ip, client| {
+                let active = now.duration_since(client.last_seen).as_secs() < 60;
+                if !active {
+                    info!("Client {} ({}) timed out, releasing IP {}", client.client_id, client.addr, ip);
+                }
+                active
+            });
+        }
+    });
+
     // Loop 1: Handle UDP packets (Client -> Server)
     let socket_recv = socket.clone();
     let peer_map_recv = peer_map.clone();
     let config_token = config.token.clone();
     
-    let ip_allocator = Arc::new(Mutex::new(move || -> Ipv4Addr {
-        let ip = next_ip(network_ip, current_ip_idx);
-        current_ip_idx += 1;
-        ip
-    }));
+    // Simple Allocator: Scan 2..254 to find free IP
+    let find_free_ip = move |peers: &HashMap<Ipv4Addr, ClientInfo>| -> Option<Ipv4Addr> {
+        for i in 2..254 {
+            let ip = next_ip(network_ip, i);
+            if !peers.contains_key(&ip) {
+                return Some(ip);
+            }
+        }
+        None
+    };
 
-    // Start UDP receive task
-    let socket_send_ref = socket.clone();
-    
     // We need shared access to write to TUN (from UDP)
     let tun_writer = Arc::new(Mutex::new(tun_writer));
 
@@ -90,19 +113,42 @@ pub async fn run(config: Config) -> Result<()> {
                     match bincode::deserialize::<Packet>(packet_data) {
                         Ok(packet) => {
                             match packet {
-                                Packet::Handshake { token } => {
+                                Packet::Handshake { token, client_id } => {
                                     if token == config_token {
                                         let mut peers = peer_map_recv.lock().await;
-                                        // Simple Logic: Alloc new IP every time or check if exists?
-                                        // For simplicity, just alloc new.
-                                        let mut alloc = ip_allocator.lock().await;
-                                        let new_ip = alloc();
-                                        
-                                        info!("Handshake from {}, assigning {}", addr, new_ip);
-                                        peers.insert(new_ip, ClientInfo {
-                                            addr,
-                                            _last_seen: std::time::Instant::now(),
-                                        });
+
+                                        // Check if this client ID already has an IP
+                                        let mut assigned_ip = None;
+                                        for (ip, client) in peers.iter() {
+                                            if client.client_id == client_id {
+                                                assigned_ip = Some(*ip);
+                                                break;
+                                            }
+                                        }
+
+                                        let new_ip = if let Some(ip) = assigned_ip {
+                                            // Update address/timestamp
+                                            if let Some(c) = peers.get_mut(&ip) {
+                                                c.addr = addr;
+                                                c.last_seen = std::time::Instant::now();
+                                            }
+                                            info!("Re-handshake from known client {} ({}), keeping IP {}", client_id, addr, ip);
+                                            ip
+                                        } else {
+                                            // Allocate new
+                                            if let Some(ip) = find_free_ip(&peers) {
+                                                info!("Handshake from new client {} ({}), assigning {}", client_id, addr, ip);
+                                                peers.insert(ip, ClientInfo {
+                                                    addr,
+                                                    last_seen: std::time::Instant::now(),
+                                                    client_id: client_id.clone(),
+                                                });
+                                                ip
+                                            } else {
+                                                warn!("No free IPs available for client {}", addr);
+                                                continue; 
+                                            }
+                                        };
 
                                         // Relay mode naturally supports all NAT types (Cone, Symmetric, etc)
                                         // since server relays traffic and responds to the source port of the client.
@@ -126,23 +172,32 @@ pub async fn run(config: Config) -> Result<()> {
                                             let _ = writer.write_all(&data).await;
                                         } else {
                                             // Relay
-                                            let peers = peer_map_recv.lock().await;
+                                            let mut peers = peer_map_recv.lock().await;
+                                            
+                                            // Optional: Update sender info from source IP in packet
+                                            if data.len() >= 20 {
+                                                let src = std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+                                                if let Some(sender) = peers.get_mut(&src) {
+                                                    sender.last_seen = std::time::Instant::now();
+                                                    sender.addr = addr; 
+                                                }
+                                            }
+
                                             if let Some(target) = peers.get(&dst) {
                                                 let _ = socket_recv.send_to(packet_data, target.addr).await;
-                                            } else {
-                                                // Unknown dest, maybe drop
                                             }
                                         }
-                                        
-                                        // Update sender last seen? We don't know who sent this IP packet easily
-                                        // without looking at the outer map, but we trust the sender addr?
-                                        // This naive impl allows spoofing.
-                                        // In real world, we should check Source IP inside packet matches the expected Addr.
                                     }
                                 }
                                 Packet::Keepalive => {
-                                    // Find who sent this and update last_seen?
-                                    // We'd need to reverse lookup addr to IP or just store addr->last_seen
+                                    // Update keepalive using address map scan (inefficient but works for small scale)
+                                    let mut peers = peer_map_recv.lock().await;
+                                    for (_, client) in peers.iter_mut() {
+                                        if client.addr == addr {
+                                            client.last_seen = std::time::Instant::now();
+                                            break;
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
