@@ -91,17 +91,28 @@ jobs:
           $Zip = "wintun.zip"
           Invoke-WebRequest -Uri $Url -OutFile $Zip
           Expand-Archive -Path $Zip -DestinationPath wintun_extract
+          
+          # Wintun zip structure contains: bin/amd64/wintun.dll, bin/x86/wintun.dll, etc.
+          # For x86_64-pc-windows-msvc, we need the "amd64" version (standard 64-bit).
           Copy-Item "wintun_extract/wintun/bin/amd64/wintun.dll" -Destination "staging/"
+          
           Remove-Item $Zip
           Remove-Item -Recurse wintun_extract
 
-      # Archive
-      - name: Create Archive
+      # Archive (Unix)
+      - name: Create Archive (Unix)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           cd staging
           zip -r ../${{ matrix.name }}.zip ./*
-          cd ..
+
+      # Archive (Windows)
+      - name: Create Archive (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.name }}.zip
 
       # Upload Release Asset
       - name: Release
