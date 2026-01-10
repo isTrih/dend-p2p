@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dend-p2p · P2P 连接工具</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="/static/js/vue.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+    <div class="dashboard">
+        <!-- 头部 -->
+        <div class="header">
+            <div class="logo">De</div>
+            <div class="header-content">
+                <h1>dend-p2p · P2P 直连组网</h1>
+                <div class="product-version">一键组网 · 远程办公 · 游戏串流</div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <!-- 左侧：我的设备 -->
+            <div class="card">
+                <div class="card-header">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                        <line x1="8" y1="21" x2="16" y2="21"></line>
+                        <line x1="12" y1="17" x2="12" y2="21"></line>
+                    </svg>
+                    我的设备
+                </div>
+                <div class="card-body">
+                    <div class="credentials">
+                        <div class="credential-item">
+                            <div class="credential-label">
+                                我的连接码
+                                <div class="tooltip">
+                                    <button class="copy-btn" @click="copyClientId">
+                                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+                                        </svg>
+                                        复制连接码
+                                        <span class="tooltiptext">{{ copyStatus.id }}</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="credential-value">{{ localDevice.clientId }}</div>
+                        </div>
+                    </div>
+
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <div class="info-label">本机虚拟IP地址</div>
+                            <div class="info-value">{{ localDevice.IP }}/24</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">NAT 类型</div>
+                            <div class="info-value">
+                                <a href="https://www.checkmynat.com" target="_blank" class="nat-test-link">
+                                    点击测试
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                                        <polyline points="15,3 21,3 21,9"></polyline>
+                                        <line x1="10" y1="14" x2="21" y2="3"></line>
+                                    </svg>
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧：连接远程设备 -->
+            <div class="card">
+                <div class="card-header">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="8.5" cy="7" r="4"></circle>
+                        <line x1="20" y1="8" x2="20" y2="14"></line>
+                        <line x1="23" y1="11" x2="17" y2="11"></line>
+                    </svg>
+                    连接远程设备
+                </div>
+                <div class="card-body">
+                    <div class="status-card" v-if="connectionStatus.online || connectionStatus.message !== '未连接'">
+                        <div class="status-header">
+                            <div class="status-dot" :style="{
+                                backgroundColor: connectionStatus.online ? 'var(--success)' : 'var(--danger)'
+                            }"></div>
+                            {{ connectionStatus.message }}
+                        </div>
+
+                        <div v-if="connectionStatus.online" class="status-body">
+                            <div class="status-item">
+                                <span class="status-label">连接模式</span>
+                                <span class="status-value" :style="{
+                                    color: connectionInfo.modeCode === 0 ? 'var(--success)' :
+                                           connectionInfo.modeCode === 1 ? 'var(--warning)' : 'var(--danger)'
+                                }">
+                                    {{ connectionInfo.mode }}
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">远程虚拟IP</span>
+                                <span class="status-value">
+                                    {{ peerDevice.IP }}/24
+                                    <div class="tooltip">
+                                        <button class="copy-btn" @click="copyPeerIP">
+                                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+                                            </svg>
+                                            复制IP
+                                            <span class="tooltiptext">{{ copyStatus.peerIP }}</span>
+                                        </button>
+                                    </div>
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">往返延迟</span>
+                                <span class="status-value" :style="{ color: peerDevice.latency <= 100 ? 'var(--success)' : 'var(--warning)' }">
+                                    {{ peerDevice.latency >= 0 ? peerDevice.latency + 'ms' : '-' }}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="connection-form">
+                        <div class="input-group">
+                            <label class="input-label">
+                                对方的连接码
+                                <span class="input-required">*</span>
+                            </label>
+                            <input v-model="targetId"
+                                   type="text"
+                                   class="connection-input"
+                                   placeholder="输入连接码"
+                                   maxlength="36">
+                        </div>
+
+                        <button class="connect-btn"
+                                :class="{ 'disabled': connectionStatus.online || isConnecting }"
+                                :disabled="connectionStatus.online || isConnecting"
+                                @click="connectPeer">
+                            {{ connectionStatus.online ? '设备已连接' : (isConnecting ? '正在建立连接...' : '开始连接') }}
+                        </button>
+
+                        <div class="connection-tips">
+                            <p>提示：确保对方也运行了 dend-p2p 并处于连接状态</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部状态栏 -->
+        <div class="status-bar">
+            <span class="status-item">
+                状态: <span :class="statusClass">{{ statusText }}</span>
+            </span>
+            <span class="status-item" v-if="localAddr">
+                本地端口: {{ localAddr }}
+            </span>
+            <span class="status-item" v-if="serverAddr">
+                服务器: {{ serverAddr }}
+            </span>
+        </div>
+    </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

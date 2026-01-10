@@ -1,19 +1,62 @@
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Packet {
+    // 客户端 <-> 服务器
     Handshake { token: String, client_id: String },
     HandshakeAck { ip: String, cidr: String },
-    Data(Vec<u8>), // Raw IP packet
     Keepalive,
-    // v0.2.0 P2P 扩展
-    // S -> C: 告诉 Client，虚拟 IP 为 `peer_vip` 的设备，公网地址是 `peer_addr`
+
+    // 客户端请求连接对等节点
+    RequestConnect { target_id: String, password: String },
+
+    // v0.2.2 P2P 扩展 - 服务器通知双方打洞
+    ConnectPeer {
+        peer_vip: Ipv4Addr,
+        peer_addr: Ipv4Addr,
+        port: u16,
+        peer_id: String,
+    },
+
+    // 服务器通知客户端更换端口
+    ChangePort { password: String },
+
+    // 客户端端口更换完毕回调
+    PortChanged { client_id: String },
+
+    // 服务器通知双方启用中转
+    EnableRelay { src_id: String, target_id: String, vip: String },
+    RelayEnabled { peer_id: String, peer_vip: String },
+
+    // 服务器通知断开连接
+    DisconnectPeer,
+
+    // 中转模式相关
+    RelayLatencyTest { target_id: String, timestamp: u64 },
+    RelayLatencyReply { target_id: String, timestamp: u64 },
+
+    // 数据传输
+    Data(Vec<u8>), // Raw IP packet
+    KeepalivePacket,
+
+    // P2P 打洞
     PeerInfo { peer_vip: String, peer_addr: String },
-    // C <-> C: 打洞包，用于检测直连通性
     Punch { vip: String },
-    // v0.2.1 Latency Measure
+    Beat {
+        use_port: u16,
+        vip: String,
+        c: u32,
+        t: i64,
+        a: u32,
+        id: String,
+    },
+    BeatAck { t: i64 },
+
+    // 延迟测量
     Ping(u64), // timestamp (millis)
     Pong(u64), // echo timestamp
+
     Error(String),
 }
 

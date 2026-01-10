@@ -1,59 +1,60 @@
 mod config;
-mod protocol;
+pub mod protocol;
 mod server;
-mod client;
-mod cache;
+pub mod client;
+pub mod cache;
+mod client_webui;
 
 use anyhow::Result;
 use clap::Parser;
 use log::{info, error};
 use std::env;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author = "HUA Haohui", version, about = "A P2P connection tool", long_about = None)]
+#[command(author = "HUA Haohui", version, about = "P2P 直连组网工具", long_about = None)]
 struct Args {
-    /// Path to configuration file
+    /// 配置文件路径
     #[arg(short, long, default_value = "config.toml")]
     config: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger
+    // 初始化日志
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
 
-    // Windows: Check wintun.dll
+    // Windows: 检查 wintun.dll
     #[cfg(target_os = "windows")]
     {
         if !std::path::Path::new("wintun.dll").exists() {
             error!("错误: 未找到 wintun.dll!");
             error!("请从 https://www.wintun.net/ 下载并将其放在此程序同一目录下。");
-            error!("Error: wintun.dll not found! Please download from https://www.wintun.net/ and place it here.");
-            // 可以在此添加自动下载逻辑，但为了保持简洁，仅提示用户。
+            return Ok(());
         }
     }
 
     let args = Args::parse();
-    info!("Loading config from {}", args.config);
+    info!("正在加载配置: {}", args.config);
 
     let config = match config::Config::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to load config: {}", e);
+            error!("加载配置失败: {}", e);
             return Ok(());
         }
     };
 
     match config.mode {
         config::Mode::Server => {
-            info!("Starting in SERVER mode");
+            info!("【服务器模式】启动中...");
             server::run(config).await?;
         }
         config::Mode::Client => {
-            info!("Starting in CLIENT mode");
+            info!("【客户端模式】启动中...");
             client::run(config).await?;
         }
     }
