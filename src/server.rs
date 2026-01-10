@@ -160,6 +160,36 @@ pub async fn run(config: Config) -> Result<()> {
                                         if let Ok(resp_bytes) = bincode::serialize(&resp) {
                                             let _ = socket_recv.send_to(&resp_bytes, addr).await;
                                         }
+
+                                        // V2 P2P: Broadcast new peer info to other clients
+                                        // For simplicity, just tell EVERYONE about the new guy, and tell the new guy about EVERYONE.
+                                        // (In large scale this is bad, but for small groups it's fine)
+                                        let my_vip_str = new_ip.to_string();
+                                        let my_real_addr_str = addr.to_string();
+                                        
+                                        // 1. Tell new guy about existing peers
+                                        for (peer_ip, peer_info) in peers.iter() {
+                                            if *peer_ip == new_ip { continue; }
+                                            let p = Packet::PeerInfo {
+                                                peer_vip: peer_ip.to_string(),
+                                                peer_addr: peer_info.addr.to_string(),
+                                            };
+                                            if let Ok(b) = bincode::serialize(&p) {
+                                                let _ = socket_recv.send_to(&b, addr).await;
+                                            }
+                                        }
+
+                                        // 2. Tell existing peers about new guy
+                                        let p_new = Packet::PeerInfo {
+                                            peer_vip: my_vip_str,
+                                            peer_addr: my_real_addr_str,
+                                        };
+                                        if let Ok(b_new) = bincode::serialize(&p_new) {
+                                            for (peer_ip, peer_info) in peers.iter() {
+                                                if *peer_ip == new_ip { continue; }
+                                                let _ = socket_recv.send_to(&b_new, peer_info.addr).await;
+                                            }
+                                        }
                                     }
                                 }
                                 Packet::Data(data) => {
@@ -199,6 +229,21 @@ pub async fn run(config: Config) -> Result<()> {
                                         }
                                     }
                                 }
+                                Packet::Ping(ts) => {
+                                    // Reply Pong immediately for RTT measurement
+                                    let pong = Packet::Pong(ts);
+                                    if let Ok(bytes) = bincode::serialize(&pong) {
+                                        let _ = socket_recv.send_to(&bytes, addr).await;
+                                    }
+                                    // Also treat as keepalive
+                                    let mut peers = peer_map_recv.lock().await;
+                                    for (_, client) in peers.iter_mut() {
+                                        if client.addr == addr {
+                                            client.last_seen = std::time::Instant::now();
+                                            break;
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -215,7 +260,7 @@ pub async fn run(config: Config) -> Result<()> {
     });
 
     // Loop 2: Read from TUN -> Send to Client (Server -> Client)
-    let socket_tun = socket_send_ref;
+    let socket_tun = socket.clone();
     let peer_map_tun = peer_map.clone();
     
     let mut buf_tun = [0u8; 4096];

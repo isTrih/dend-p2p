@@ -8,7 +8,16 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::Duration;
 
-mod cache;
+
+
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+struct PeerState {
+    real_addr: SocketAddr,
+    is_p2p: bool,
+    last_punch: std::time::Instant,
+}
 
 pub async fn run(config: Config) -> Result<()> {
     // Load or create client ID
@@ -20,8 +29,11 @@ pub async fn run(config: Config) -> Result<()> {
     let server_addr: SocketAddr = config.server_addr.parse().context("服务器地址无效")?;
     
     // Bind to any local port
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     info!("客户端绑定端口: {}", socket.local_addr()?);
+
+    // Peer Map: VIP -> Real Addr
+    let p2p_peers: Arc<Mutex<HashMap<Ipv4Addr, PeerState>>> = Arc::new(Mutex::new(HashMap::new()));
     
     // 1. Handshake Loop
     let my_ip: Ipv4Addr;
@@ -64,15 +76,10 @@ pub async fn run(config: Config) -> Result<()> {
     tun_config.destination(Ipv4Addr::new(10, 10, 0, 1)); // Set gateway/peer? simple ptp usually
 
     if let Some(name) = &config.tun_name {
-        // macOS utun devices must be named "utunX" where X is a number (e.g. utun0, utun1)
-        // or simply allow the system to pick one by not setting a name if the user provided one isn't valid?
-        // But for cross-platform simplicity, we might just let the system pick if on macOS and the name doesn't start with utun.
-        // Or we warn the user.
-        
         #[cfg(target_os = "macos")]
         {
             if !name.starts_with("utun") {
-               warn!("在 macOS 上，TUN 设备名称必须以 'utun' 开头且后跟数字 (如 utun5)。由于配置名称 '{}' 不符合规范，将自动使用系统分配的名称。", name, name);
+               warn!("在 macOS 上，TUN 设备名称必须以 'utun' 开头且后跟数字 (如 utun5)。由于配置名称 '{}' 不符合规范，将自动使用系统分配的名称。", name);
                // 不设置 name，让系统自动分配
             } else {
                 tun_config.name(name);
@@ -93,33 +100,51 @@ pub async fn run(config: Config) -> Result<()> {
     let tun_dev = tun::create_as_async(&tun_config).context("创建 TUN 设备失败")?;
     info!("TUN 设备已创建");
     
-    // Windows 平台特殊修复：
-    // 当 TUN 获取到 IP 且子网掩码只有 IP 本身时，路由表可能将发往公网服务器的流量错误地路由到了 TUN 接口。
-    // 这会导致 "UDP 发包 -> 路由到 TUN -> 读取 TUN -> UDP 发包 -> 路由到 TUN" 的死循环，
-    // 或者直接报错 "Unreachable host" (os error 10065)，因为系统认为去往服务器的路径不通。
-    // 
-    // 解决方案：为防止 UDP socket 绑定的流量走 TUN，我们需要将 UDP socket 绑定到具体的物理网卡 IP (但这在 DHCP 下会变且麻烦)。
-    // 或者，更简单的：确保 TUN 的掩码和路由不要覆盖去往服务器 123.60.176.158 的路径。
-    // 当前我们设置了 TUN IP 和默认路由？看代码：destination(10.10.0.1)
-    
-    // Windows 下，tun crate 可能会默认添加路由。如果出现 10065，说明去往 Server 的路由坏了。
-    // 这是一个常见的 VPN/TUN 路由冲突问题。
-    // 暂时可以通过只绑定 socket 到 0.0.0.0 来尝试解决（我们已经这么做了）。
-    // 
-    // 更有可能是 Windows 防火墙或路由表优先级的锅。
-    
     let (mut tun_reader, mut tun_writer) = tokio::io::split(tun_dev);
-    let socket = Arc::new(socket);
+    // let socket = Arc::new(socket); // Already Arc above
 
-    // 3. Keepalive Task
+    // 3. Keepalive & P2P Punch/Ping Task
     let socket_ka = socket.clone();
+    let p2p_peers_ka = p2p_peers.clone();
+    let my_ip_str = my_ip.to_string();
+    
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let packet = Packet::Keepalive;
-            if let Ok(bytes) = bincode::serialize(&packet) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            
+            // Keepalive to Server (Use Ping for RTT)
+            let ping_packet = Packet::Ping(now);
+            if let Ok(bytes) = bincode::serialize(&ping_packet) {
                 let _ = socket_ka.send_to(&bytes, server_addr).await;
             }
+
+            // P2P Punching / Ping
+            let mut peers = p2p_peers_ka.lock().await;
+            let instant_now = std::time::Instant::now();
+            let punch_packet = Packet::Punch { vip: my_ip_str.clone() };
+            let punch_bytes = bincode::serialize(&punch_packet).unwrap_or_default();
+            
+            let ping_bytes = bincode::serialize(&ping_packet).unwrap_or_default();
+
+            for (vip, state) in peers.iter_mut() {
+                // 如果还未 P2P 直连，发送 Punch (2s)
+                if !state.is_p2p {
+                    if instant_now.duration_since(state.last_punch).as_secs() >= 2 {
+                        let _ = socket_ka.send_to(&punch_bytes, state.real_addr).await;
+                        state.last_punch = instant_now;
+                    }
+                } else {
+                    // 如果已经 P2P 直连，发送 Ping (维持心跳 + 测延迟, 2s)
+                     if instant_now.duration_since(state.last_punch).as_secs() >= 2 {
+                        let _ = socket_ka.send_to(&ping_bytes, state.real_addr).await;
+                        state.last_punch = instant_now;
+                        // debug!("Sending Ping to P2P peer {}", vip);
+                    }
+                }
+            }
+
+            drop(peers);
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
@@ -127,6 +152,8 @@ pub async fn run(config: Config) -> Result<()> {
     
     // Task: TUN -> Socket
     let socket_send = socket.clone();
+    let p2p_peers_send = p2p_peers.clone();
+    
     let tun_read_task = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         loop {
@@ -134,11 +161,25 @@ pub async fn run(config: Config) -> Result<()> {
                 Ok(len) => {
                     if len == 0 { break; }
                     let data = &buf[..len];
+                    // Check dest IP
+                    let dst_ip = crate::protocol::get_dest_ip(data);
+                    
+                    let mut target_addr = server_addr;
+                    
+                    if let Some(ip) = dst_ip {
+                        let peers = p2p_peers_send.lock().await;
+                        if let Some(state) = peers.get(&ip) {
+                            if state.is_p2p {
+                                target_addr = state.real_addr;
+                            }
+                        }
+                    }
+
                     // Encapsulate
                     let packet = Packet::Data(data.to_vec());
                     if let Ok(bytes) = bincode::serialize(&packet) {
-                        if let Err(e) = socket_send.send_to(&bytes, server_addr).await {
-                            error!("发送到服务器失败: {}", e);
+                        if let Err(e) = socket_send.send_to(&bytes, target_addr).await {
+                            error!("发送到 {} 失败: {}", target_addr, e);
                         }
                     }
                 }
@@ -152,21 +193,85 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Task: Socket -> TUN
     let socket_recv = socket.clone();
+    let p2p_peers_recv = p2p_peers.clone();
+    
     let tun_write_task = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         loop {
             match socket_recv.recv_from(&mut buf).await {
                 Ok((len, src)) => {
-                    if src == server_addr {
-                        match bincode::deserialize::<Packet>(&buf[..len]) {
-                            Ok(Packet::Data(data)) => {
-                                if let Err(e) = tun_writer.write_all(&data).await {
-                                    error!("写入 TUN 错误: {}", e);
+                    let packet_data = &buf[..len];
+                    
+                    match bincode::deserialize::<Packet>(packet_data) {
+                        Ok(Packet::Data(data)) => {
+                            // 收到数据包
+                            // 如果是从 Server 来的，说明是中继
+                            // 如果是从其他 IP 来的，说明是 P2P 直连
+                            
+                            // 更新 P2P 状态? 如果收到直连 Data 包，说明 P2P 是通的
+                            if src != server_addr {
+                                // 这是一个 P2P 数据包
+                                // 反向查找 VIP? 比较麻烦，暂时只需确认收到数据即可写入 TUN
+                            }
+
+                            if let Err(e) = tun_writer.write_all(&data).await {
+                                error!("写入 TUN 错误: {}", e);
+                            }
+                        }
+                        Ok(Packet::PeerInfo { peer_vip, peer_addr }) => {
+                            if let (Ok(vip), Ok(raddr)) = (peer_vip.parse::<Ipv4Addr>(), peer_addr.parse::<SocketAddr>()) {
+                                info!("收到 Peer 信息: VIP={} Real={}", vip, raddr);
+                                let mut peers = p2p_peers_recv.lock().await;
+                                peers.entry(vip).or_insert(PeerState {
+                                    real_addr: raddr,
+                                    is_p2p: false, // Default false, wait for punch ack
+                                    last_punch: std::time::Instant::now(),
+                                });
+                                // 如果之前已经有 entry，更新地址
+                                if let Some(state) = peers.get_mut(&vip) {
+                                    state.real_addr = raddr;
+                                    // Reset p2p state? Maybe network changed
+                                    state.is_p2p = false;
                                 }
                             }
-                            Ok(Packet::Keepalive) => {} // Ping back?
-                            _ => {}
                         }
+                        Ok(Packet::Punch { vip }) => {
+                            // 收到打洞包
+                            if let Ok(vip_addr) = vip.parse::<Ipv4Addr>() {
+                                info!("收到来自 {} ({}) 的打洞包! P2P 连接建立。", vip_addr, src);
+                                let mut peers = p2p_peers_recv.lock().await;
+                                let state = peers.entry(vip_addr).or_insert(PeerState {
+                                    real_addr: src, // Trust source addr of punch
+                                    is_p2p: true,
+                                    last_punch: std::time::Instant::now(),
+                                });
+                                state.is_p2p = true;
+                                state.real_addr = src; // Update to actual working address
+                                
+                                // 回复一个 Punch 确认? 实际上只要双方互相发 Punch，就能通。
+                                // 这里我们选择“收到 Punch 就认为通了”，下次发 Data 就走直连。
+                                // 为了让对方也认为通，我们需要确保我们也发了 Punch。
+                                // 周期性任务会负责发 Punch。
+                            }
+                        }
+                        Ok(Packet::Keepalive) => {} 
+                        Ok(Packet::Ping(ts)) => {
+                            // Reply Pong
+                            let pong = Packet::Pong(ts);
+                            if let Ok(bytes) = bincode::serialize(&pong) {
+                                let _ = socket_recv.send_to(&bytes, src).await;
+                            }
+                        }
+                        Ok(Packet::Pong(ts)) => {
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                            let rtt = now.saturating_sub(ts);
+                            if src == server_addr {
+                                info!("【中转】延迟: {} ms", rtt);
+                            } else {
+                                info!("【P2P】延迟: {} ms (来自 {})", rtt, src);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Err(e) => {

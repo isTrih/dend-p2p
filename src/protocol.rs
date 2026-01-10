@@ -6,6 +6,14 @@ pub enum Packet {
     HandshakeAck { ip: String, cidr: String },
     Data(Vec<u8>), // Raw IP packet
     Keepalive,
+    // v0.2.0 P2P 扩展
+    // S -> C: 告诉 Client，虚拟 IP 为 `peer_vip` 的设备，公网地址是 `peer_addr`
+    PeerInfo { peer_vip: String, peer_addr: String },
+    // C <-> C: 打洞包，用于检测直连通性
+    Punch { vip: String },
+    // v0.2.1 Latency Measure
+    Ping(u64), // timestamp (millis)
+    Pong(u64), // echo timestamp
     Error(String),
 }
 
