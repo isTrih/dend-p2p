@@ -17,6 +17,7 @@ struct PeerState {
     real_addr: SocketAddr,
     is_p2p: bool,
     last_punch: std::time::Instant,
+    punch_attempts: u32, // Count punch attempts for aggressive mode
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -126,12 +127,34 @@ pub async fn run(config: Config) -> Result<()> {
             
             let ping_bytes = bincode::serialize(&ping_packet).unwrap_or_default();
 
-            for (vip, state) in peers.iter_mut() {
-                // 如果还未 P2P 直连，发送 Punch (2s)
+            for (_vip, state) in peers.iter_mut() {
+                // 如果还未 P2P 直连，发送 Punch (aggressive mode logic)
                 if !state.is_p2p {
-                    if instant_now.duration_since(state.last_punch).as_secs() >= 2 {
+                    // Aggressive punching: every 500ms
+                    // For Port Restricted Cone NAT / Symmetric NAT, we need frequent packets
+                    // to ensure one gets through when the other side's hole opens.
+                    if instant_now.duration_since(state.last_punch).as_millis() >= 500 {
+                        // 1. Send to primary address (most likely correct for Full Cone / Address Restricted)
                         let _ = socket_ka.send_to(&punch_bytes, state.real_addr).await;
+                        
+                        // 2. Symmetric NAT Port Prediction (Birthday Attack Light)
+                        // If peer is Symmetric, they might be using a different port for us.
+                        // We try ports near the one observed by the server.
+                        if let SocketAddr::V4(v4) = state.real_addr {
+                            let port = v4.port();
+                            // Try ports +/- 1, 2, 3... limited range to avoid too much spam
+                            // But ONLY if we haven't successfully connected yet
+                            for offset in [-1, 1, -2, 2] {
+                                let new_port = (port as i32 + offset) as u16;
+                                if new_port > 0 {
+                                     let try_addr = SocketAddr::V4(std::net::SocketAddrV4::new(*v4.ip(), new_port));
+                                     let _ = socket_ka.send_to(&punch_bytes, try_addr).await;
+                                }
+                            }
+                        }
+
                         state.last_punch = instant_now;
+                        state.punch_attempts += 1;
                     }
                 } else {
                     // 如果已经 P2P 直连，发送 Ping (维持心跳 + 测延迟, 2s)
@@ -144,7 +167,8 @@ pub async fn run(config: Config) -> Result<()> {
             }
 
             drop(peers);
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Main loop interval: check often (e.g. 100ms) to support aggressive 500ms punch
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
 
@@ -226,12 +250,14 @@ pub async fn run(config: Config) -> Result<()> {
                                     real_addr: raddr,
                                     is_p2p: false, // Default false, wait for punch ack
                                     last_punch: std::time::Instant::now(),
+                                    punch_attempts: 0,
                                 });
                                 // 如果之前已经有 entry，更新地址
                                 if let Some(state) = peers.get_mut(&vip) {
                                     state.real_addr = raddr;
                                     // Reset p2p state? Maybe network changed
                                     state.is_p2p = false;
+                                    state.punch_attempts = 0; // Reset attempts to trigger aggressive mode again
                                 }
                             }
                         }
@@ -244,14 +270,13 @@ pub async fn run(config: Config) -> Result<()> {
                                     real_addr: src, // Trust source addr of punch
                                     is_p2p: true,
                                     last_punch: std::time::Instant::now(),
+                                    punch_attempts: 0,
                                 });
                                 state.is_p2p = true;
                                 state.real_addr = src; // Update to actual working address
                                 
-                                // 回复一个 Punch 确认? 实际上只要双方互相发 Punch，就能通。
-                                // 这里我们选择“收到 Punch 就认为通了”，下次发 Data 就走直连。
-                                // 为了让对方也认为通，我们需要确保我们也发了 Punch。
-                                // 周期性任务会负责发 Punch。
+                                // Reset punch attempts to normal ping mode
+                                state.punch_attempts = 0;
                             }
                         }
                         Ok(Packet::Keepalive) => {} 
