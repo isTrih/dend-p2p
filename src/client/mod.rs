@@ -138,6 +138,7 @@ struct PunchHoleConfig {
     base_port_offset: i32,
     enable_relay: bool,
     punch_timeout: u64,
+    punch_retry: u32,
     relay_fallback: bool,
     keepalive_interval: u64,  // v0.2.3: 保活间隔（秒）
     punch_interval: u64,      // v0.2.3: 打洞包间隔（毫秒）
@@ -150,10 +151,27 @@ impl Default for PunchHoleConfig {
             port_range: 6,
             base_port_offset: 0,
             enable_relay: true,
-            punch_timeout: 10,
+            punch_timeout: 300,      // 默认 300 秒超时
+            punch_retry: 3,          // 默认 3 轮重试
             relay_fallback: true,
             keepalive_interval: 30,  // 每30秒发送一次保活包（NAT超时通常为30-60秒）
             punch_interval: 200,     // 每200ms发送一次打洞包
+        }
+    }
+}
+
+impl From<&Config> for PunchHoleConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            max_concurrency: 2,
+            port_range: 6,
+            base_port_offset: 0,
+            enable_relay: true,
+            punch_timeout: config.punch_timeout,    // 从配置文件读取
+            punch_retry: config.punch_retry,        // 从配置文件读取
+            relay_fallback: true,
+            keepalive_interval: 30,
+            punch_interval: 200,
         }
     }
 }
@@ -181,8 +199,10 @@ pub async fn run(config: Config) -> Result<()> {
     let conn_state = Arc::new(RwLock::new(ConnectionState::default()));
     let peer_map: Arc<Mutex<HashMap<Ipv4Addr, PeerState>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // 打洞配置
-    let punch_config = Arc::new(PunchHoleConfig::default());
+    // 打洞配置（从配置文件读取）
+    let punch_config = Arc::new(PunchHoleConfig::from(&config));
+    info!("[配置] P2P 超时时间: {} 秒", punch_config.punch_timeout);
+    info!("[配置] P2P 重试轮次: {} 轮", punch_config.punch_retry);
 
     // ==================== 阶段 1: 握手 ====================
     let my_ip: Ipv4Addr;
@@ -388,6 +408,13 @@ pub async fn run(config: Config) -> Result<()> {
                     let punch_config = &*punch_config_ka;
                     let punch_interval = punch_config.punch_interval;
                     let port_range = punch_config.port_range as u16;
+
+                    // 检查是否超过最大重试轮次
+                    if punch_round >= punch_config.punch_retry {
+                        debug!("[打洞] 已完成 {} 轮，等待超时...", punch_round);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
 
                     // 检查是否到了发送打洞包的时间
                     if now.duration_since(last_punch).as_millis() >= punch_interval as u128 {
@@ -682,13 +709,16 @@ async fn detect_nat_type(socket: Arc<UdpSocket>, server_addr: SocketAddr, local_
     };
 
     if let Ok(bytes) = bincode::serialize(&packet) {
-        if let Ok(_) = socket.send_to(&bytes, server_addr).await {
+        info!("[NAT] 发送检测包到服务器, 本地端口: {}", local_addr.port());
+        if let Ok(sent) = socket.send_to(&bytes, server_addr).await {
+            info!("[NAT] 已发送 {} 字节, 等待响应...", sent);
             // 等待服务器响应
             let mut buf = [0u8; 1024];
-            let timeout_result = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await;
+            let timeout_result = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
 
             match timeout_result {
                 Ok(Ok((len, src))) => {
+                    info!("[NAT] 收到来自 {} 的响应 ({} 字节)", src, len);
                     if src == server_addr {
                         if let Ok(Packet::NatTypeResult { nat_type, mapped_port, .. }) =
                             bincode::deserialize::<Packet>(&buf[..len])
@@ -702,16 +732,22 @@ async fn detect_nat_type(socket: Arc<UdpSocket>, server_addr: SocketAddr, local_
                                 4 => NatType::Nat4,
                                 _ => NatType::Unknown,
                             };
+                        } else {
+                            error!("[NAT] 反序列化响应失败");
                         }
+                    } else {
+                        warn!("[NAT] 响应来源不匹配: 期望 {}, 收到 {}", server_addr, src);
                     }
                 }
                 Ok(Err(e)) => {
                     error!("NAT 检测接收错误: {}", e);
                 }
                 Err(_) => {
-                    warn!("NAT 检测超时");
+                    warn!("NAT 检测超时 (3秒)");
                 }
             }
+        } else {
+            error!("[NAT] 发送检测包失败");
         }
     }
 

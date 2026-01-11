@@ -22,6 +22,13 @@ pub struct Config {
     // Client specific
     #[serde(default = "default_webui")]
     pub webui: bool,
+
+    // P2P configuration
+    #[serde(default = "default_punch_timeout")]
+    pub punch_timeout: u64,
+
+    #[serde(default = "default_punch_retry")]
+    pub punch_retry: u32,
 }
 
 fn default_webui() -> bool {
@@ -34,6 +41,14 @@ fn default_webui() -> bool {
     {
         true
     }
+}
+
+fn default_punch_timeout() -> u64 {
+    300 // 默认 300 秒超时
+}
+
+fn default_punch_retry() -> u32 {
+    3 // 默认 3 轮重试
 }
 
 impl Config {
