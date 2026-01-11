@@ -957,14 +957,36 @@ async fn create_tun_device(tun_name: &Option<String>, ip: Ipv4Addr) -> Result<tu
     {
         let network = format!("{}.0/24", ip.to_string().rsplitn(2, '.').last().unwrap_or("10.10"));
 
+        // 动态获取 TUN 设备名称
+        let tun_device = if let Some(name) = tun_name {
+            name.clone()
+        } else {
+            // 尝试通过 ip link 获取最新的 tun 设备
+            std::process::Command::new("ip")
+                .args(&["link", "show"])
+                .output()
+                .ok()
+                .and_then(|output| {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // 查找类似 "dend0:" 或 "tun0:" 的设备
+                    for line in stdout.lines() {
+                        if line.contains(": tun:") || line.contains(": dent:") {
+                            return line.split(':').next().map(|s| s.trim().to_string());
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| "tun0".to_string())
+        };
+
         // 使用 ip route 添加路由
         let route_output = std::process::Command::new("ip")
-            .args(&["route", "add", &network, "dev", "dend0"])
+            .args(&["route", "add", &network, "dev", &tun_device])
             .output();
 
         match route_output {
             Ok(output) if output.status.success() => {
-                info!("已添加路由: {} -> dend0", network);
+                info!("已添加路由: {} -> {}", network, tun_device);
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);

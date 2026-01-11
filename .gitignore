@@ -1,3 +1,7 @@
 target/
 natun-master/
 .DS_Store
+.idea/
+.vscode/
+*.log
+.claude/
