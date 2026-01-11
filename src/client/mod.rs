@@ -905,7 +905,83 @@ async fn create_tun_device(tun_name: &Option<String>, ip: Ipv4Addr) -> Result<tu
         config.packet_information(true);
     });
 
-    tun::create_as_async(&config).context("创建 TUN 设备失败")
+    let tun_dev = tun::create_as_async(&config).context("创建 TUN 设备失败")?;
+
+    // macOS 上需要手动配置 IP 和路由
+    #[cfg(target_os = "macos")]
+    {
+        // 尝试获取设备名称
+        let device_name = tun_name.clone()
+            .or_else(|| {
+                // 尝试通过 ifconfig 获取
+                std::process::Command::new("ifconfig")
+                    .arg("utun")
+                    .output()
+                    .ok()
+                    .and_then(|output| {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        stdout.lines().next()?.split_whitespace().next().map(|s| s.to_string())
+                    })
+            })
+            .unwrap_or_else(|| "utun0".to_string());
+
+        info!("macOS TUN 设备: {}", device_name);
+
+        // 添加路由到虚拟网络（确保对等节点可达）
+        let network = format!("{}.0/24", ip.to_string().rsplitn(2, '.').last().unwrap_or("10.10"));
+        let route_output = std::process::Command::new("route")
+            .args(&["-n", "add", "-net", &network, "-interface", &device_name])
+            .output();
+
+        match route_output {
+            Ok(output) if output.status.success() => {
+                info!("已添加路由: {} -> {}", network, device_name);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 路由已存在不是错误
+                if !stderr.contains("File exists") {
+                    warn!("route 配置失败: {}", stderr);
+                } else {
+                    info!("路由已存在，跳过添加");
+                }
+            }
+            Err(e) => {
+                warn!("执行 route 失败: {}", e);
+            }
+        }
+    }
+
+    // Linux 上也需要确保路由配置正确
+    #[cfg(target_os = "linux")]
+    {
+        let network = format!("{}.0/24", ip.to_string().rsplitn(2, '.').last().unwrap_or("10.10"));
+
+        // 使用 ip route 添加路由
+        let route_output = std::process::Command::new("ip")
+            .args(&["route", "add", &network, "dev", "dend0"])
+            .output();
+
+        match route_output {
+            Ok(output) if output.status.success() => {
+                info!("已添加路由: {} -> dend0", network);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 路由已存在不是错误
+                if !stderr.contains("File exists") {
+                    warn!("ip route 配置失败: {}", stderr);
+                } else {
+                    info!("路由已存在，跳过添加");
+                }
+            }
+            Err(e) => {
+                warn!("执行 ip route 失败: {}", e);
+            }
+        }
+    }
+
+    Ok(tun_dev)
 }
 
 // ==================== 获取连接状态 API ====================
