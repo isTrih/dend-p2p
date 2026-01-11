@@ -255,14 +255,19 @@ pub async fn run(config: Config) -> Result<()> {
                                     let _ = socket_recv.send_to(&resp_bytes, addr).await;
                                 }
 
-                                // 通知其他客户端有新节点加入
-                                broadcast_new_peer(
-                                    &socket_recv,
-                                    &peers,
-                                    addr,
-                                    &new_ip,
-                                    &client_id,
-                                ).await;
+                                // 只通知新客户端关于现有的对等节点，不广播新客户端给其他人
+                                // 这样可以避免自动触发 P2P 打洞，客户端可以自主决定何时连接
+                                for (peer_addr, client) in peers.iter() {
+                                    if peer_addr != &addr {
+                                        let peer_packet = Packet::PeerInfo {
+                                            peer_vip: client.vip.unwrap().to_string(),
+                                            peer_addr: peer_addr.to_string(),
+                                        };
+                                        if let Ok(peer_bytes) = bincode::serialize(&peer_packet) {
+                                            let _ = socket_recv.send_to(&peer_bytes, addr).await;
+                                        }
+                                    }
+                                }
                             }
 
                             // ==================== 心跳 ====================
@@ -530,40 +535,6 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 // ==================== 辅助函数 ====================
-
-async fn broadcast_new_peer(
-    socket: &UdpSocket,
-    peers: &HashMap<SocketAddr, ClientInfo>,
-    new_addr: SocketAddr,
-    new_ip: &Ipv4Addr,
-    _new_id: &str,
-) {
-    let packet = Packet::PeerInfo {
-        peer_vip: new_ip.to_string(),
-        peer_addr: new_addr.to_string(),
-    };
-
-    if let Ok(bytes) = bincode::serialize(&packet) {
-        for (addr, client) in peers.iter() {
-            if addr != &new_addr {
-                let _ = socket.send_to(&bytes, client.addr).await;
-            }
-        }
-
-        // 也通知新客户端关于现有的对等节点
-        for (addr, client) in peers.iter() {
-            if addr != &new_addr {
-                let peer_packet = Packet::PeerInfo {
-                    peer_vip: client.vip.unwrap().to_string(),
-                    peer_addr: addr.to_string(),
-                };
-                if let Ok(peer_bytes) = bincode::serialize(&peer_packet) {
-                    let _ = socket.send_to(&peer_bytes, new_addr).await;
-                }
-            }
-        }
-    }
-}
 
 async fn notify_change_port(
     socket: &UdpSocket,
