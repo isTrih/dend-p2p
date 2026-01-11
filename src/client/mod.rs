@@ -4,6 +4,8 @@ use crate::cache::ClientCache;
 use crate::client_webui;
 use anyhow::{Result, Context};
 use log::{info, error, warn, debug};
+use rand::seq::SliceRandom;
+use rand::Rng;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,6 +92,8 @@ struct ConnectionState {
     punch_initiated: bool, // v0.2.3: 是否已发起打洞（用户点击连接后才为true）
     server_ping_time: Option<Instant>, // 记录发送给服务器的 Ping 时间
     p2p_ping_time: Option<Instant>,    // 记录发送给 P2P 对等节点的 Ping 时间
+    punch_timeout_task: Option<tokio::task::JoinHandle<()>>, // 防止重复启动超时任务
+    punch_round: u32,                  // 当前打洞轮次
 }
 
 impl Default for ConnectionState {
@@ -110,6 +114,8 @@ impl Default for ConnectionState {
             punch_initiated: false,
             server_ping_time: None,
             p2p_ping_time: None,
+            punch_timeout_task: None,
+            punch_round: 0,
         }
     }
 }
@@ -339,7 +345,7 @@ pub async fn run(config: Config) -> Result<()> {
             }
 
             // 获取当前连接状态
-            let (is_p2p, punch_initiated, peer_addr, peer_vip, last_punch) = {
+            let (is_p2p, punch_initiated, peer_addr, peer_vip, last_punch, punch_round) = {
                 let state = conn_state_ka.read().await;
                 (
                     state.is_p2p,
@@ -347,6 +353,7 @@ pub async fn run(config: Config) -> Result<()> {
                     state.peer_addr,
                     state.peer_vip,
                     state.last_punch,
+                    state.punch_round,
                 )
             };
 
@@ -380,27 +387,38 @@ pub async fn run(config: Config) -> Result<()> {
                 if punch_initiated && !is_p2p {
                     let punch_config = &*punch_config_ka;
                     let punch_interval = punch_config.punch_interval;
+                    let port_range = punch_config.port_range as u16;
 
                     // 检查是否到了发送打洞包的时间
                     if now.duration_since(last_punch).as_millis() >= punch_interval as u128 {
                         let peer_port = addr.port();
-                        let ports: Vec<u16> = generate_port_list(
+                        let peer_ip = addr.ip();
+
+                        // 生成并随机化端口列表（类似 natun-master）
+                        let mut ports: Vec<u16> = generate_port_list(
                             peer_port,
-                            punch_config.port_range,
+                            port_range,
                             punch_config.base_port_offset,
                         ).collect();
+
+                        // 随机打乱端口顺序
+                        ports.shuffle(&mut rand::thread_rng());
 
                         let concurrency = punch_config.max_concurrency;
                         let mut handles = Vec::new();
 
-                        // 并发发送打洞包
-                        for (i, port) in ports.into_iter().enumerate() {
+                        info!("[打洞] 第 {} 轮扫描, 目标: {}:{}, 端口范围: {} 个",
+                            punch_round + 1, peer_ip, peer_port, ports.len());
+
+                        // 并发发送打洞包（类似 natun-master 的并发扫描）
+                        for (_i, port) in ports.into_iter().enumerate() {
                             // 不要向自己打洞
                             if local_addr.port() == port && local_addr.ip() == addr.ip() {
+                                debug!("[打洞] 跳过自连接端口 {}", port);
                                 continue;
                             }
 
-                            let target_addr = SocketAddr::new(addr.ip(), port);
+                            let target_addr = SocketAddr::new(peer_ip, port);
                             let socket = socket_ka.clone();
                             let packet = Packet::Punch {
                                 vip: my_ip.to_string(),
@@ -408,16 +426,24 @@ pub async fn run(config: Config) -> Result<()> {
 
                             if let Ok(bytes) = bincode::serialize(&packet) {
                                 let handle = tokio::spawn(async move {
-                                    let _ = socket.send_to(&bytes, target_addr).await;
-                                    // 随机延迟避免同时到达
-                                    tokio::time::sleep(Duration::from_millis((i * 10) as u64)).await;
+                                    match socket.send_to(&bytes, target_addr).await {
+                                        Ok(_) => {
+                                            debug!("[打洞] 发送到 {}:{} 成功", target_addr.ip(), target_addr.port());
+                                        }
+                                        Err(e) => {
+                                            debug!("[打洞] 发送到 {}:{} 失败: {}", target_addr.ip(), target_addr.port(), e);
+                                        }
+                                    }
+                                    // 随机延迟避免洪水攻击（基于端口号的确定性延迟，避免使用 RNG）
+                                    let delay = 10 + (port % 50) as u64;
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
                                 });
                                 handles.push(handle);
-                            }
 
-                            // 限制并发数
-                            if handles.len() >= concurrency {
-                                let _ = handles.remove(0).await;
+                                // 限制并发数
+                                if handles.len() >= concurrency {
+                                    let _ = handles.remove(0).await;
+                                }
                             }
                         }
 
@@ -427,8 +453,11 @@ pub async fn run(config: Config) -> Result<()> {
                         }
 
                         let mut state = conn_state_ka.write().await;
-                        state.last_punch = now;
+                        state.last_punch = Instant::now();
                         state.punch_attempts += 1;
+                        state.punch_round += 1; // 增加轮次计数
+
+                        info!("[打洞] 第 {} 轮完成, 共尝试 {} 次", state.punch_round, state.punch_attempts);
                     }
                 }
             }
@@ -500,7 +529,7 @@ pub async fn run(config: Config) -> Result<()> {
                             Packet::Punch { vip } => {
                                 // 收到打洞包，说明 P2P 直连已建立
                                 if let Ok(vip_addr) = vip.parse::<Ipv4Addr>() {
-                                    info!("收到来自 {} ({}) 的打洞包! P2P 连接建立。", vip_addr, src);
+                                    info!("[P2P] 收到来自 {} ({}) 的打洞包!", vip_addr, src);
 
                                     let mut state = conn_state_recv.write().await;
                                     state.is_p2p = true;
@@ -511,13 +540,14 @@ pub async fn run(config: Config) -> Result<()> {
                                     state.is_connecting = false;
                                     state.connect_message = String::new();
                                     state.punch_initiated = false;  // 重置打洞标记
+                                    state.punch_timeout_task = None; // 取消超时任务
 
                                     info!("========================================");
                                     info!("  P2P 直连已建立!");
                                     info!("========================================");
                                     info!("对等节点: {}", vip_addr);
                                     info!("连接模式: 直连");
-                                    info!("延迟: {} ms", state.last_latency);
+                                    info!("打洞轮次: {}, 尝试次数: {}", state.punch_round + 1, state.punch_attempts);
 
                                     // 更新 WEBUI 状态
                                     client_webui::set_connection_status(
@@ -588,6 +618,7 @@ pub async fn run(config: Config) -> Result<()> {
                                         state.mode = ConnectionMode::Direct;
                                         state.connect_message = String::new();
                                         state.is_connecting = false;
+                                        state.punch_timeout_task = None; // 取消超时任务
 
                                         info!("========================================");
                                         info!("  P2P 直连已建立!");
@@ -595,6 +626,7 @@ pub async fn run(config: Config) -> Result<()> {
                                         info!("对等节点: {}", state.peer_vip.map(|v| v.to_string()).unwrap_or_else(|| "未知".to_string()));
                                         info!("连接模式: 直连");
                                         info!("延迟: {} ms", rtt);
+                                        info!("打洞轮次: {}, 尝试次数: {}", state.punch_round + 1, state.punch_attempts);
                                     }
 
                                     info!("【P2P】延迟: {} ms (来自 {})", rtt, src);
@@ -709,23 +741,35 @@ async fn handle_server_packet(
                 state.connect_message = "正在建立 P2P 连接...".to_string();
                 state.connect_failed = false;
                 state.punch_attempts = 0;
+                state.punch_round = 0;
+
+                // 取消之前可能存在的超时任务
+                if let Some(old_task) = state.punch_timeout_task.take() {
+                    old_task.abort();
+                }
+
+                info!("[P2P] 开始打洞, 超时时间: {}秒", punch_config.punch_timeout);
 
                 drop(state);
 
-                // 启动打洞超时检测
-                let conn_state = conn_state.clone();
+                // 启动打洞超时检测（只启动一个任务）
+                let conn_state_inner = conn_state.clone();
                 let punch_config = punch_config.clone();
 
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(punch_config.punch_timeout)).await;
 
-                    let mut state = conn_state.write().await;
+                    let mut state = conn_state_inner.write().await;
+
+                    // 再次检查，防止重复处理
                     if !state.is_p2p && state.is_connecting {
-                        warn!("打洞超时（{}秒），切换到中转模式", punch_config.punch_timeout);
+                        warn!("[P2P] 打洞超时（{}秒），尝试次数: {}", punch_config.punch_timeout, state.punch_attempts);
 
                         if punch_config.enable_relay && punch_config.relay_fallback {
                             state.mode = ConnectionMode::Relay;
                             state.connect_message = "使用中转模式".to_string();
+                            state.is_connecting = false;
+                            state.punch_timeout_task = None;
 
                             info!("========================================");
                             info!("  P2P 直连失败，切换到中转模式");
@@ -752,14 +796,21 @@ async fn handle_server_packet(
                             state.connect_failed = true;
                             state.connect_message = "连接失败：无法建立 P2P 连接".to_string();
                             state.is_connecting = false;
+                            state.punch_timeout_task = None;
 
                             error!("========================================");
                             error!("  P2P 连接失败");
                             error!("========================================");
                             error!("对等节点: {}", state.peer_vip.map(|v| v.to_string()).unwrap_or_else(|| "未知".to_string()));
                         }
+                    } else {
+                        state.punch_timeout_task = None;
                     }
                 });
+
+                // 保存超时任务句柄
+                let mut state = conn_state.write().await;
+                state.punch_timeout_task = Some(task);
             }
         }
         Packet::ConnectPeer { peer_vip, peer_addr, port, .. } => {

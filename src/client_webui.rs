@@ -233,7 +233,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 </head>
 <body>
 <div id="app">
-    <div class="version-badge">v<span id="appVersion">0.2.9</span></div>
+    <div class="version-badge">v<span id="appVersion">0.3.0</span></div>
     <div class="dashboard">
         <div class="header">
             <div class="logo">De</div>
