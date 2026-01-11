@@ -581,25 +581,39 @@ pub async fn run(config: Config) -> Result<()> {
                                 } else if src == server_addr {
                                     info!("【中转】延迟: {} ms", rtt);
                                 } else {
+                                    // 收到对等节点的Pong，建立P2P直连
+                                    if !state.is_p2p {
+                                        // 首次收到对等节点响应，建立直连
+                                        state.is_p2p = true;
+                                        state.mode = ConnectionMode::Direct;
+                                        state.connect_message = String::new();
+                                        state.is_connecting = false;
+
+                                        info!("========================================");
+                                        info!("  P2P 直连已建立!");
+                                        info!("========================================");
+                                        info!("对等节点: {}", state.peer_vip.map(|v| v.to_string()).unwrap_or_else(|| "未知".to_string()));
+                                        info!("连接模式: 直连");
+                                        info!("延迟: {} ms", rtt);
+                                    }
+
                                     info!("【P2P】延迟: {} ms (来自 {})", rtt, src);
 
-                                    // 更新 WEBUI 延迟显示
-                                    if state.is_p2p {
-                                        client_webui::set_connection_status(
-                                            client_webui::ConnectionStatus {
-                                                mode: "直连".to_string(),
-                                                mode_code: 0,
-                                                is_connected: true,
-                                                status_text: "P2P 连接已建立".to_string(),
-                                                is_connecting: false,
-                                                connect_failed: false,
-                                                connect_message: String::new(),
-                                                peer_ip: src.ip().to_string(),
-                                                peer_latency: state.last_latency,
-                                                online_devices: vec![],
-                                            }
-                                        );
-                                    }
+                                    // 更新 WEBUI 状态
+                                    client_webui::set_connection_status(
+                                        client_webui::ConnectionStatus {
+                                            mode: "直连".to_string(),
+                                            mode_code: 0,
+                                            is_connected: true,
+                                            status_text: "P2P 连接已建立".to_string(),
+                                            is_connecting: false,
+                                            connect_failed: false,
+                                            connect_message: String::new(),
+                                            peer_ip: src.ip().to_string(),
+                                            peer_latency: rtt,
+                                            online_devices: vec![],
+                                        }
+                                    );
                                 }
                             }
                             _ => {}

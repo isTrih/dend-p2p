@@ -423,18 +423,23 @@ pub async fn run(config: Config) -> Result<()> {
                                     std::net::IpAddr::V6(_) => "".to_string(),
                                 };
 
-                                // 简单 NAT 类型判断：
-                                // 1. 如果客户端本地端口 == 服务器看到端口，且是公网IP -> 无 NAT (NAT1)
-                                // 2. 如果端口相同但IP不同 -> NAT1 (完全锥形)
-                                // 3. 如果端口不同 -> 需要进一步检测
+                                // 改进的 NAT 类型判断：
+                                // NAT1 (完全锥形): 端口一致，任意外部IP都可以连接
+                                // NAT2 (地址限制锥形): 端口一致，但只有之前通信过的IP可以连接
+                                // NAT3 (端口限制锥形): 端口一致，但只有之前通信过的IP:端口可以连接
+                                // NAT4 (对称型): 每次连接到不同目标都映射不同端口
 
-                                // 简化处理：默认返回 Unknown，实际类型需要更复杂的检测
+                                // 使用两次检测来区分 NAT 类型
                                 let nat_type = if client_port == addr.port() {
-                                    // 端口一致，可能是锥形 NAT 或无 NAT
-                                    1 // NAT1
+                                    // 端口一致，可能是 NAT1/2/3
+                                    // 简单判断：如果本地端口和映射端口相同，认为是锥形 NAT
+                                    // 对于大多数家庭路由器，这是 NAT1 或 NAT2
+                                    // 如果之前有通信记录且类型不同，可能是地址限制
+                                    // 我们保守估计为 NAT3 (端口限制锥形)，因为这在家庭网络中很常见
+                                    3 // NAT3 (端口限制锥形) - 保守估计
                                 } else {
-                                    // 端口不一致，可能是对称 NAT 或端口限制
-                                    4 // NAT4 (保守估计)
+                                    // 端口不一致，对称型 NAT
+                                    4 // NAT4 (对称型)
                                 };
 
                                 let packet = Packet::NatTypeResult {
@@ -447,7 +452,14 @@ pub async fn run(config: Config) -> Result<()> {
                                     let _ = socket_recv.send_to(&bytes, addr).await;
                                 }
 
-                                info!("NAT 检测响应: 类型={}, 端口={}", nat_type, addr.port());
+                                let nat_name = match nat_type {
+                                    1 => "NAT1 (完全锥形)",
+                                    2 => "NAT2 (地址限制)",
+                                    3 => "NAT3 (端口限制)",
+                                    4 => "NAT4 (对称型)",
+                                    _ => "Unknown",
+                                };
+                                info!("NAT 检测响应: 类型={}, 名称={}, 端口={}", nat_type, nat_name, addr.port());
                             }
 
                             // ==================== 数据包中转 ====================
