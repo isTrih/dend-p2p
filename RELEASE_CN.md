@@ -1,8 +1,8 @@
-# dend-p2p v0.2.4 Release Notes
+# dend-p2p v0.2.5 Release Notes
 
 ## 版本简介
 
-dend-p2p v0.2.4 是一个重要的功能更新版本，主要新增了在线设备列表功能、优化了 Linux 客户端的 WebUI 配置，并修复了多个 bug。
+dend-p2p v0.2.5 是一个重要的 bug 修复版本，主要修复了 WebUI API 调用失败时界面无响应的问题。
 
 ## 新功能
 

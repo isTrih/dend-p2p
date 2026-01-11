@@ -233,7 +233,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 </head>
 <body>
 <div id="app">
-    <div class="version-badge">v<span id="appVersion">0.2.3</span></div>
+    <div class="version-badge">v<span id="appVersion">0.2.5</span></div>
     <div class="dashboard">
         <div class="header">
             <div class="logo">De</div>
@@ -348,75 +348,90 @@ function getNatClass(natType) {
 }
 
 async function pollStatus() {
+    // 获取连接状态
     try {
         const response = await fetch('/api/peerStatus', { method: 'POST' });
-        const data = await response.json();
+        if (response.ok) {
+            const data = await response.json();
+            if (data.status) {
+                const status = data.status;
+                const device = data.device;
 
-        if (data.status) {
-            const status = data.status;
-            const device = data.device;
+                const statusDiv = document.getElementById('connectionStatus');
+                const statusDot = document.getElementById('statusDot');
+                const statusText = document.getElementById('statusText');
+                const mainStatus = document.getElementById('mainStatus');
+                const connectBtn = document.getElementById('connectBtn');
 
-            const statusDiv = document.getElementById('connectionStatus');
-            const statusDot = document.getElementById('statusDot');
-            const statusText = document.getElementById('statusText');
-            const mainStatus = document.getElementById('mainStatus');
-            const connectBtn = document.getElementById('connectBtn');
+                if (status.isConnected) {
+                    statusDiv.style.display = 'block';
+                    statusDot.style.backgroundColor = 'var(--success)';
+                    statusText.textContent = status.statusText || '已连接';
+                    mainStatus.textContent = '已连接 (' + status.mode + ')';
+                    mainStatus.className = 'status-online';
+                    connectBtn.textContent = '已连接';
+                    connectBtn.disabled = true;
 
-            if (status.isConnected) {
-                statusDiv.style.display = 'block';
-                statusDot.style.backgroundColor = 'var(--success)';
-                statusText.textContent = status.statusText || '已连接';
-                mainStatus.textContent = '已连接 (' + status.mode + ')';
-                mainStatus.className = 'status-online';
-                connectBtn.textContent = '已连接';
-                connectBtn.disabled = true;
+                    document.getElementById('connectionMode').textContent = status.mode;
+                    document.getElementById('latency').textContent = device.latency >= 0 ? device.latency + 'ms' : '-';
+                } else if (status.isConnecting) {
+                    statusDiv.style.display = 'block';
+                    statusDot.style.backgroundColor = 'var(--warning)';
+                    statusText.textContent = status.statusText || '连接中...';
+                    mainStatus.textContent = '连接中...';
+                    mainStatus.className = 'status-connecting';
+                    connectBtn.textContent = '连接中...';
+                    connectBtn.disabled = true;
+                } else {
+                    statusDiv.style.display = 'none';
+                    mainStatus.textContent = '未连接';
+                    mainStatus.className = 'status-offline';
+                    connectBtn.textContent = '开始连接';
+                    connectBtn.disabled = false;
+                }
 
-                document.getElementById('connectionMode').textContent = status.mode;
-                document.getElementById('latency').textContent = device.latency >= 0 ? device.latency + 'ms' : '-';
-            } else if (status.isConnecting) {
-                statusDiv.style.display = 'block';
-                statusDot.style.backgroundColor = 'var(--warning)';
-                statusText.textContent = status.statusText || '连接中...';
-                mainStatus.textContent = '连接中...';
-                mainStatus.className = 'status-connecting';
-                connectBtn.textContent = '连接中...';
-                connectBtn.disabled = true;
-            } else {
-                statusDiv.style.display = 'none';
-                mainStatus.textContent = '未连接';
-                mainStatus.className = 'status-offline';
-                connectBtn.textContent = '开始连接';
-                connectBtn.disabled = false;
+                // 更新在线设备列表
+                if (data.devices && data.devices.length > 0) {
+                    const devicesDiv = document.getElementById('onlineDevices');
+                    devicesDiv.innerHTML = data.devices.map(d => '
+                        <div class="device-item" onclick="setTargetId(\'' + d.clientId + '\')">
+                            <div class="device-info">
+                                <span class="device-id">' + d.clientId + '</span>
+                                <span class="device-ip">' + d.IP + '</span>
+                            </div>
+                            <span class="device-status ' + (d.alive ? 'online' : 'offline') + '">' + (d.alive ? '在线' : '离线') + '</span>
+                        </div>
+                    ').join('');
+                }
             }
-        }
-
-        const deviceResponse = await fetch('/api/device', { method: 'POST' });
-        const deviceData = await deviceResponse.json();
-
-        document.getElementById('clientId').textContent = deviceData.clientId;
-        document.getElementById('localIp').textContent = deviceData.IP + '/24';
-
-        const natType = deviceData.natType || 'unknown';
-        document.getElementById('natType').innerHTML = '<span class="nat-badge ' + getNatClass(natType) + '">' + (NAT_TYPE_NAMES[natType] || NAT_TYPE_NAMES['unknown']) + '</span>';
-        document.getElementById('natStatus').textContent = NAT_TYPE_NAMES[natType] || NAT_TYPE_NAMES['unknown'];
-
-        document.getElementById('appVersion').textContent = deviceData.version || '0.2.3';
-
-        // 更新在线设备列表
-        if (data.devices && data.devices.length > 0) {
-            const devicesDiv = document.getElementById('onlineDevices');
-            devicesDiv.innerHTML = data.devices.map(d => '
-                <div class="device-item" onclick="setTargetId(\'' + d.clientId + '\')">
-                    <div class="device-info">
-                        <span class="device-id">' + d.clientId + '</span>
-                        <span class="device-ip">' + d.IP + '</span>
-                    </div>
-                    <span class="device-status ' + (d.alive ? 'online' : 'offline') + '">' + (d.alive ? '在线' : '离线') + '</span>
-                </div>
-            ').join('');
         }
     } catch (e) {
         console.error('获取状态失败:', e);
+    }
+
+    // 获取本地设备信息（独立处理）
+    try {
+        const deviceResponse = await fetch('/api/device', { method: 'POST' });
+        if (deviceResponse.ok) {
+            const deviceData = await deviceResponse.json();
+
+            if (deviceData.clientId) {
+                document.getElementById('clientId').textContent = deviceData.clientId;
+            }
+            if (deviceData.IP) {
+                document.getElementById('localIp').textContent = deviceData.IP + '/24';
+            }
+
+            const natType = deviceData.natType || 'unknown';
+            document.getElementById('natType').innerHTML = '<span class="nat-badge ' + getNatClass(natType) + '">' + (NAT_TYPE_NAMES[natType] || NAT_TYPE_NAMES['unknown']) + '</span>';
+            document.getElementById('natStatus').textContent = NAT_TYPE_NAMES[natType] || NAT_TYPE_NAMES['unknown'];
+
+            if (deviceData.version) {
+                document.getElementById('appVersion').textContent = deviceData.version;
+            }
+        }
+    } catch (e) {
+        console.error('获取设备信息失败:', e);
     }
 }
 
