@@ -233,7 +233,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 </head>
 <body>
 <div id="app">
-    <div class="version-badge">v<span id="appVersion">0.2.5</span></div>
+    <div class="version-badge">v<span id="appVersion">0.2.6</span></div>
     <div class="dashboard">
         <div class="header">
             <div class="logo">De</div>
@@ -393,15 +393,19 @@ async function pollStatus() {
                 // 更新在线设备列表
                 if (data.devices && data.devices.length > 0) {
                     const devicesDiv = document.getElementById('onlineDevices');
-                    devicesDiv.innerHTML = data.devices.map(d => '
-                        <div class="device-item" onclick="setTargetId(\'' + d.clientId + '\')">
-                            <div class="device-info">
-                                <span class="device-id">' + d.clientId + '</span>
-                                <span class="device-ip">' + d.IP + '</span>
-                            </div>
-                            <span class="device-status ' + (d.alive ? 'online' : 'offline') + '">' + (d.alive ? '在线' : '离线') + '</span>
-                        </div>
-                    ').join('');
+                    let html = '';
+                    data.devices.forEach(d => {
+                        const statusClass = d.alive ? 'online' : 'offline';
+                        const statusText = d.alive ? '在线' : '离线';
+                        html += '<div class="device-item" onclick="setTargetId(\'' + d.clientId + '\')">';
+                        html += '<div class="device-info">';
+                        html += '<span class="device-id">' + d.clientId + '</span>';
+                        html += '<span class="device-ip">' + d.IP + '</span>';
+                        html += '</div>';
+                        html += '<span class="device-status ' + statusClass + '">' + statusText + '</span>';
+                        html += '</div>';
+                    });
+                    devicesDiv.innerHTML = html;
                 }
             }
         }
